@@ -18,4 +18,5 @@ mkdir -p dist
 cp plugin/target/wasm32-unknown-unknown/release/marcs_digicam_emulator.wasm dist/marcs-digicam-emulator.wasm
 ls -l dist/*.wasm
 
+(cd common && cargo test --release --quiet)
 (cd harness && cargo test --release --quiet)

@@ -1,4 +1,4 @@
-# Marcs Digicam Emulator (v0.1.2)
+# Marcs Digicam Emulator (v0.1.3)
 
 The look of 2000s CCD compact cameras for **PhotoCraft**, as one WebAssembly filter plug-in
 (plug-in ABI v1): eight cameras from 2002 to 2009, each a modelled CCD sensor (primary RGB or
@@ -116,9 +116,9 @@ ISO) and sharpening (unsharp mask on luma with a small threshold).
   little at ISO 800 and 1600.
 - No JPEG artefacts, resolution loss or date stamp (yet).
 - Speed: every pixel takes the full path (noise makes each one different, so a colour cache like
-  the film emulator's misses too often: tried, 30–50 % slower), about 44 s for 24 MP on two
-  threads in the test host, up to about 54 s when many highlights are blown (blooming and fringing
-  then run; Blooming and Purple Fringing at 0 skip them); PhotoCraft runs four bands at once.
+  the film emulator's misses too often: tried, 30–50 % slower), about 37 s for 24 MP on two
+  threads in the test host, about 42 s when many highlights are blown and about 50 s with a
+  Strength below 100 or a Display P3 / Adobe RGB document; PhotoCraft runs four bands at once.
 - RGB and Grayscale only.
 
 ## Layout
@@ -130,7 +130,7 @@ ISO) and sharpening (unsharp mask on luma with a small threshold).
 | `model/digicam_model.py` | the camera model → `lut/<camera>.lut` and `plugin/src/cameras.rs` |
 | `model/make_tables.py` | decode tables, Adobe RGB tables, the sensor noise texture |
 | `harness/` | test host mirroring PhotoCraft's plug-in host; `cargo test --release` there checks the plug-in in `dist/` (Strength 0 is the identity for every input space, depth and grey, every camera at every depth and ISO, primaries keep their hue in every input space, monotonic grey without noise, noise growing with ISO, a highlight clipped in the document blooms vertically and fringes purple) |
-| `build.sh` | build and test (`--data` re-runs the model first) |
+| `build.sh` | build and test (`--data` re-runs the model first); `common/` has a test of its own (the radius-1 blur against the general one) |
 
 ## Licence
 

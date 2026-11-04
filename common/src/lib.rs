@@ -3,7 +3,7 @@
 //!
 //! The plug-in keeps its own exported `pc_abi_version`, `pc_manifest`, `pc_alloc`, `pc_filter`
 //! and panic handler (they must live in the cdylib itself); they call in here.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod blur;
 
@@ -30,6 +30,7 @@ pub fn pack_manifest(m: &str) -> u64 {
 
 /// `pc_alloc`: fresh pages from `memory.grow` (each band runs in a fresh instance, nothing is
 /// freed). 0 if the host's memory limit is reached.
+#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 pub fn alloc(size: u32) -> u32 {
     let pages = (size as usize).div_ceil(65536).max(1);
