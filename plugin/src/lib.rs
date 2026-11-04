@@ -29,7 +29,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 const MANIFEST: &str = r#"{
   "id": "io.marcs.digicam",
   "name": "Marcs Digicam Emulator…",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "kind": "filter",
   "author": "Marc Gronenberg",
   "description": "The look of 2000s CCD compact cameras: sensor colour, hard digital highlights, sensor noise by ISO, noise reduction, oversharpening, blooming and purple fringing. RGB and Grayscale.",
@@ -139,11 +139,12 @@ const DG: usize = N * 3;
 const DB: usize = N * N * 3;
 
 /// Tetrahedral interpolation in the cell at `p0` with fractions (fr, fg, fb); sRGB-encoded rgb.
+/// The LUT is the camera's, as floats 0..1 (`pc_filter` converts it once per band).
 ///
 /// # Safety
 /// `p0` is a cell's first corner, so that all 8 corners lie inside the LUT.
 #[inline(always)]
-unsafe fn tetra(p0: *const u16, fr: f32, fg: f32, fb: f32) -> (f32, f32, f32) {
+unsafe fn tetra(p0: *const f32, fr: f32, fg: f32, fb: f32) -> (f32, f32, f32) {
     let (a, b, w1, w2, w3) = if fr > fg {
         if fg > fb {
             (DR, DR + DG, fr - fg, fg - fb, fb)
@@ -159,22 +160,54 @@ unsafe fn tetra(p0: *const u16, fr: f32, fg: f32, fb: f32) -> (f32, f32, f32) {
     } else {
         (DG, DR + DG, fg - fr, fr - fb, fb)
     };
-    // the u16 scale folded into the weights
-    const S: f32 = 1.0 / 65535.0;
-    let (w1, w2, w3) = (w1 * S, w2 * S, w3 * S);
-    let w0 = S - (w1 + w2 + w3);
+    let w0 = 1.0 - (w1 + w2 + w3);
     unsafe {
         let (pa, pb, pc) = (p0.add(a), p0.add(b), p0.add(DR + DG + DB));
-        let c = |k: usize| w0 * *p0.add(k) as f32 + w1 * *pa.add(k) as f32 + w2 * *pb.add(k) as f32 + w3 * *pc.add(k) as f32;
+        let c = |k: usize| w0 * *p0.add(k) + w1 * *pa.add(k) + w2 * *pb.add(k) + w3 * *pc.add(k);
         (c(0), c(1), c(2))
     }
 }
 
-/// The LUT cell and fraction along one axis for a shaper coordinate (clamped to 0..1).
-#[inline(always)]
-fn cell(u: f32) -> (usize, f32) {
+/// The float exponents the shaper table covers: the LUT's 13 stops around 0.18 lie in 2^-11 .. 2^3.
+const SH_E0: i32 = -11;
+/// 14 exponents × the top 8 mantissa bits.
+const SH_LEN: usize = 14 * 256;
+
+/// The shaper table: entry `k` is the LUT position (0..N-1, unclamped) of the float with exponent
+/// `SH_E0 + k / 256` and top mantissa bits `k % 256`, i.e. `log2_fast` and the shaper in one step
+/// (`SH_LEN + 1` floats, the last one for the interpolation).
+///
+/// # Safety
+/// `dst` holds `SH_LEN + 1` floats.
+unsafe fn build_shaper(dst: *mut f32) {
     const S: f32 = (N - 1) as f32;
-    let p = clamp01(u) * S;
+    for k in 0..=SH_LEN {
+        let e = SH_E0 + (k / 256) as i32;
+        // SAFETY: k % 256 < 257 entries of log2m; k <= SH_LEN
+        unsafe { *dst.add(k) = ((e as f32 + *tables().add(LOG2M + k % 256)) * INV_SPAN + LOG_OFF) * S };
+    }
+}
+
+/// The LUT cell and fraction along one axis for a linear value (outside the LUT's range: its edge).
+#[inline(always)]
+fn cell(sh: *const f32, v: f32) -> (usize, f32) {
+    const S: f32 = (N - 1) as f32;
+    let v = if v > 1e-30 { v } else { 1e-30 };
+    let bits = v.to_bits();
+    let k = (bits >> 15) as i32 - ((127 + SH_E0) << 8);
+    let p = if k < 0 {
+        0.0
+    } else if k >= SH_LEN as i32 {
+        S
+    } else {
+        let f = (bits & 0x7fff) as f32 * (1.0 / 32768.0);
+        // SAFETY: 0 <= k < SH_LEN
+        unsafe {
+            let a = *sh.add(k as usize);
+            a + (*sh.add(k as usize + 1) - a) * f
+        }
+    };
+    let p = if p > 0.0 { if p < S { p } else { S } } else { 0.0 };
     let i = p as usize;
     let i = if i < N - 1 { i } else { N - 2 };
     (i, p - i as f32)
@@ -198,9 +231,8 @@ fn log2_fast(v: f32) -> f32 {
 
 /// The camera's rendering of a linear scene colour (grey 0.18), sRGB-encoded.
 #[inline(always)]
-fn render(lut: *const u16, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
-    let u = |v: f32| log2_fast(v) * INV_SPAN + LOG_OFF;
-    let ((ir, fr), (ig, fg), (ib, fb)) = (cell(u(r)), cell(u(g)), cell(u(b)));
+fn render(lut: *const f32, sh: *const f32, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let ((ir, fr), (ig, fg), (ib, fb)) = (cell(sh, r), cell(sh, g), cell(sh, b));
     // SAFETY: ir, ig, ib <= N-2, so every corner index stays below LUT_LEN.
     unsafe { tetra(lut.add(ib * DB + ig * DG + ir * DR), fr, fg, fb) }
 }
@@ -248,7 +280,10 @@ struct Doc {
 
 /// The sensor and its noise, for one band.
 struct Sensor {
-    lut: *const u16,
+    /// the camera's LUT as floats
+    lut: *const f32,
+    /// the shaper table (`build_shaper`)
+    sh: *const f32,
     s: [[f32; 3]; 4],
     a: [[f32; 4]; 3],
     /// shot noise variance per unit of signal (full well shrinking with ISO)
@@ -351,7 +386,7 @@ unsafe fn camera<const K: usize, const NOISE: bool, const KEEP: bool>(buf: *mut 
                     b += a[2][0] * d0 + a[2][1] * d1 + a[2][2] * d2 + if K == 4 { a[2][3] * d3 } else { 0.0 };
                     nx = if nx + 1 < NT { nx + 1 } else { 0 };
                 }
-                let (or, og, ob) = render(sen.lut, r, g, b);
+                let (or, og, ob) = render(sen.lut, sen.sh, r, g, b);
                 let yy = 0.299 * or + 0.587 * og + 0.114 * ob;
                 *pl.y.add(i) = yy;
                 *pl.cb.add(i) = ob - yy;
@@ -438,7 +473,6 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     let json = unsafe { core::slice::from_raw_parts(params, params_len as usize) };
     let g = |k: &str, d: f32| json_num(json, k).unwrap_or(d);
     let cam = json_str(json, "camera").and_then(|v| CAMERAS.iter().find(|c| c.name.as_bytes() == v)).unwrap_or(&CAMERAS[2]);
-    let lut = cam.lut.0.as_ptr() as *const u16;
     let iso_gain = match json_str(json, "iso") {
         Some(b"200") => 2.0,
         Some(b"400") => 4.0,
@@ -487,7 +521,7 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     let area = w * h;
     let kn = if !keep { 0 } else if grey { 1 } else { 3 };
     let planes_len = area * 4 * (6 + kn);
-    let mem = alloc((planes_len + w * 13 + 256 * 4) as u32) as usize;
+    let mem = alloc((planes_len + w * 13 + 256 * 4 + (SH_LEN + 1) * 4 + LUT_LEN * 4) as u32) as usize;
     if mem == 0 {
         return ERR_MEMORY;
     }
@@ -495,7 +529,19 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     let (py, pcb, pcr, blown, s1, s2) = (plane(0), plane(1), plane(2), plane(3), plane(4), plane(5));
     let cols = (mem + planes_len) as *mut u32; // 3 × w words for the chroma upsampling
     let dec8 = (mem + planes_len + w * 12) as *mut f32; // 256 floats
-    let blown_cols = (mem + planes_len + w * 12 + 256 * 4) as *mut u8; // w flags (zeroed by memory.grow)
+    let sh = (mem + planes_len + w * 12 + 256 * 4) as *mut f32; // SH_LEN + 1 floats
+    let lut = (mem + planes_len + w * 12 + 256 * 4 + (SH_LEN + 1) * 4) as *mut f32; // LUT_LEN floats
+    // SAFETY: allocated above; the static LUT holds LUT_LEN u16
+    unsafe {
+        build_shaper(sh);
+        // the camera's u16 LUT as floats, once per band: the per-pixel lookup then skips 12
+        // conversions (the LUT is ~150k values, a band ~300k pixels)
+        let src = cam.lut.0.as_ptr() as *const u16;
+        for j in 0..LUT_LEN {
+            *lut.add(j) = *src.add(j) as f32 * (1.0 / 65535.0);
+        }
+    }
+    let blown_cols = (mem + planes_len + w * 12 + 256 * 4 + (SH_LEN + 1) * 4 + LUT_LEN * 4) as *mut u8; // w flags (zeroed by memory.grow)
     let k = |j: usize| if j < kn { plane(6 + j) } else { core::ptr::null_mut() };
     let pl = Planes { y: py, cb: pcb, cr: pcr, blown, cols: blown_cols, keep: [k(0), k(1), k(2)] };
     let dec8 = if depth == 8 {
@@ -512,6 +558,7 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     let doc = Doc { linear: linear_doc, grey, ident, n, dec, dec8, m_in, ev };
     let sensor = Sensor {
         lut,
+        sh,
         s: cam.scene_to_raw,
         a: cam.raw_to_scene,
         inv_fw: iso_gain / cam.full_well,

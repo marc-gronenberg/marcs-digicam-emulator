@@ -1,4 +1,4 @@
-# Marcs Digicam Emulator (v0.1.3)
+# Marcs Digicam Emulator (v0.1.4)
 
 The look of 2000s CCD compact cameras for **PhotoCraft**, as one WebAssembly filter plug-in
 (plug-in ABI v1): eight cameras from 2002 to 2009, each a modelled CCD sensor (primary RGB or
@@ -116,8 +116,8 @@ ISO) and sharpening (unsharp mask on luma with a small threshold).
   little at ISO 800 and 1600.
 - No JPEG artefacts, resolution loss or date stamp (yet).
 - Speed: every pixel takes the full path (noise makes each one different, so a colour cache like
-  the film emulator's misses too often: tried, 30–50 % slower), about 37 s for 24 MP on two
-  threads in the test host, about 42 s when many highlights are blown and about 50 s with a
+  the film emulator's misses too often: tried, 30–50 % slower), about 35 s for 24 MP on two
+  threads in the test host, about 40 s when many highlights are blown and about 47 s with a
   Strength below 100 or a Display P3 / Adobe RGB document; PhotoCraft runs four bands at once.
 - RGB and Grayscale only.
 
