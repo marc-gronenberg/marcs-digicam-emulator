@@ -1,0 +1,17 @@
+[package]
+name = "digicam-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A stand-in for PhotoCraft's plug-in host (crates/plugins): same interpreter (wasmi 2.0, same
+# features and config), same default limits, banding, overlap and params. For testing only.
+[workspace]
+
+[dependencies]
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "stable", "portable-dispatch"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+codegen-units = 4

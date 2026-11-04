@@ -1,0 +1,23 @@
+[package]
+name = "marcs-digicam-emulator"
+description = "Marcs Digicam Emulator: the look of 2000s CCD compact cameras for PhotoCraft (WebAssembly plug-in ABI v1)"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Builds for wasm32-unknown-unknown only; not part of any workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+digicam-common = { path = "../common" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

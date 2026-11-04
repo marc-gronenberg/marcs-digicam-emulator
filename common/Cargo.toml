@@ -1,0 +1,12 @@
+[package]
+name = "digicam-common"
+description = "Building blocks of Marcs Digicam Emulator: the PhotoCraft plug-in ABI v1 glue, the parameter reader, table lookups and blurs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Compiled into each plug-in; not part of any workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"

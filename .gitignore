@@ -1,0 +1,4 @@
+target/
+.DS_Store
+# built plug-in: published as a GitHub release asset
+dist/
