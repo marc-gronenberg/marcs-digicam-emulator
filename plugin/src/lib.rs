@@ -2,6 +2,11 @@
 //!
 //! Per band (with a 32 px overlap, for the spatial stages):
 //!
+//! 0. Resolution "Camera" (the default): the band is rendered at about the camera's megapixels,
+//!    each camera pixel the mean, in linear light, of an f × f block of the document grid (f a
+//!    whole number from the document's and the camera's size, 1-4), and scaled back up at the
+//!    end; the noise grain is then the camera's pixel, fine detail goes as with a real 5 MP file,
+//!    and it runs about f² times faster. "Document" renders every document pixel;
 //! 1. the document to linear sRGB (Input Space), the camera's exposure compensation;
 //! 2. sensor noise in the raw channels (shot noise from the pixel's full well, read noise, both
 //!    growing with ISO), carried into the scene through the camera's white balance and colour
@@ -29,12 +34,13 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 const MANIFEST: &str = r#"{
   "id": "io.marcs.digicam",
   "name": "Marcs Digicam Emulator…",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "kind": "filter",
   "author": "Marc Gronenberg",
-  "description": "The look of 2000s CCD compact cameras: sensor colour, hard digital highlights, sensor noise by ISO, noise reduction, oversharpening, blooming and purple fringing. RGB and Grayscale.",
+  "description": "The look of 2000s CCD compact cameras: sensor colour, hard digital highlights, sensor noise by ISO, noise reduction, oversharpening, blooming and purple fringing, at the camera's resolution. RGB and Grayscale.",
   "params": {
     "camera":     {"type": "choice", "options": ["Pocket 2002", "Prosumer 2003", "Compact 2004", "Compact 2005", "Compact 2006", "Compact 2007", "Ultracompact 2008", "Prosumer 2009"], "default": "Compact 2004"},
+    "resolution": {"type": "choice", "options": ["Camera", "Document"], "default": "Camera"},
     "inputSpace": {"type": "choice", "options": ["sRGB", "Display P3", "Adobe RGB"], "default": "sRGB"},
     "exposure":   {"type": "number", "min": -2, "max": 2, "default": 0, "unit": "EV"},
     "iso":        {"type": "choice", "options": ["100", "200", "400", "800", "1600"], "default": "100"},
@@ -96,6 +102,8 @@ pub struct Camera {
     scene_to_raw: [[f32; 3]; 4],
     /// raw noise -> linear scene, through white balance and colour matrix
     raw_to_scene: [[f32; 4]; 3],
+    /// the sensor's size (Resolution "Camera")
+    megapixels: f32,
     /// electrons at base ISO
     full_well: f32,
     sharpen: f32,
@@ -278,6 +286,32 @@ struct Doc {
     ev: f32,
 }
 
+impl Doc {
+    /// A document sample as linear light (in the document's primaries).
+    ///
+    /// # Safety
+    /// `dec` (and `dec8`, if not null) are the tables `pc_filter` set up.
+    #[inline(always)]
+    unsafe fn lin(&self, v: f32) -> f32 {
+        if self.linear {
+            if v > 0.0 { v } else { 0.0 }
+        } else if !self.dec8.is_null() {
+            unsafe { *self.dec8.add(((v * 255.0 + 0.5) as u32).min(255) as usize) }
+        } else {
+            unsafe { lerp_tab(self.dec, v) }
+        }
+    }
+
+    /// Whether the pixel at `p` has a channel at the top of an 8/16-bit document (clipped there).
+    ///
+    /// # Safety
+    /// `p` points at a pixel of the band.
+    #[inline(always)]
+    unsafe fn clipped(&self, p: *const f32) -> bool {
+        unsafe { !self.linear && (*p >= 0.999 || (!self.grey && (*p.add(1) >= 0.999 || *p.add(2) >= 0.999))) }
+    }
+}
+
 /// The sensor and its noise, for one band.
 struct Sensor {
     /// the camera's LUT as floats
@@ -298,10 +332,13 @@ struct Sensor {
     y0: i32,
 }
 
-/// What the camera stage writes, `w × h` each: the camera's output as Y'CbCr (BT.601 on the
-/// sRGB-encoded values), the blown-highlight map, a flag per column with a blown pixel, and (with
-/// `KEEP`) the document's own linear values for the Strength mix.
+/// What the camera stage reads and writes, `w × h` each: (with `LOW`) its input, the camera
+/// pixels as linear sRGB and the share of their document pixels clipped in the source; the
+/// camera's output as Y'CbCr (BT.601 on the sRGB-encoded values), the blown-highlight map, a flag
+/// per column with a blown pixel, and (with `KEEP`) the document's own linear values for the
+/// Strength mix.
 struct Planes {
+    inp: [*mut f32; 4],
     y: *mut f32,
     cb: *mut f32,
     cr: *mut f32,
@@ -313,12 +350,13 @@ struct Planes {
 /// Steps 1-3 for every pixel of the band: the scene, its raw signal (and how far the most blown
 /// channel is over full well, in stops, into `blown`), the sensor noise carried into the scene,
 /// the camera's LUT, as Y'CbCr. `K` raw channels, `NOISE` on or off, `KEEP` the document's linear
-/// values. Returns the bounding box of the blown pixels (x0, x1, y0, y1; inclusive), if any.
+/// values, `LOW` the input from `pl.inp` (camera pixels) instead of the document in `buf`.
+/// Returns the bounding box of the blown pixels (x0, x1, y0, y1; inclusive), if any.
 ///
 /// # Safety
-/// `buf` holds `w × h × doc.n` samples, the planes `w × h` values each.
+/// `buf` holds `w × h × doc.n` samples (unless `LOW`), the planes `w × h` values each.
 #[inline(always)]
-unsafe fn camera<const K: usize, const NOISE: bool, const KEEP: bool>(buf: *mut f32, w: usize, h: usize, doc: &Doc, sen: &Sensor, pl: &Planes) -> Option<(usize, usize, usize, usize)> {
+unsafe fn camera<const K: usize, const NOISE: bool, const KEEP: bool, const LOW: bool>(buf: *mut f32, w: usize, h: usize, doc: &Doc, sen: &Sensor, pl: &Planes) -> Option<(usize, usize, usize, usize)> {
     let s = &sen.s;
     let a = &sen.a;
     let (mut bx0, mut bx1, mut by0, mut by1) = (usize::MAX, 0, usize::MAX, 0);
@@ -329,25 +367,22 @@ unsafe fn camera<const K: usize, const NOISE: bool, const KEEP: bool>(buf: *mut 
         for x in 0..w {
             let i = y * w + x;
             unsafe {
-                let p = buf.add(i * doc.n);
-                let lin = |v: f32| {
-                    if doc.linear {
-                        if v > 0.0 { v } else { 0.0 }
-                    } else if !doc.dec8.is_null() {
-                        *doc.dec8.add(((v * 255.0 + 0.5) as u32).min(255) as usize)
-                    } else {
-                        lerp_tab(doc.dec, v)
+                // the scene in linear sRGB, and whether the source was clipped here
+                let (r, g, b, clipped) = if LOW {
+                    (*pl.inp[0].add(i), *pl.inp[1].add(i), *pl.inp[2].add(i), *pl.inp[3].add(i) >= 0.5)
+                } else {
+                    let p = buf.add(i * doc.n);
+                    let (dr, dg, db) = if doc.grey { let l = doc.lin(*p); (l, l, l) } else { (doc.lin(*p), doc.lin(*p.add(1)), doc.lin(*p.add(2))) };
+                    if KEEP {
+                        *pl.keep[0].add(i) = dr;
+                        if !doc.grey {
+                            *pl.keep[1].add(i) = dg;
+                            *pl.keep[2].add(i) = db;
+                        }
                     }
+                    let (r, g, b) = if doc.ident { (dr, dg, db) } else { mat(&doc.m_in, dr, dg, db) };
+                    (r, g, b, doc.clipped(p))
                 };
-                let (dr, dg, db) = if doc.grey { let l = lin(*p); (l, l, l) } else { (lin(*p), lin(*p.add(1)), lin(*p.add(2))) };
-                if KEEP {
-                    *pl.keep[0].add(i) = dr;
-                    if !doc.grey {
-                        *pl.keep[1].add(i) = dg;
-                        *pl.keep[2].add(i) = db;
-                    }
-                }
-                let (r, g, b) = if doc.ident { (dr, dg, db) } else { mat(&doc.m_in, dr, dg, db) };
                 let (mut r, mut g, mut b) = (if r > 0.0 { r * doc.ev } else { 0.0 }, if g > 0.0 { g * doc.ev } else { 0.0 }, if b > 0.0 { b * doc.ev } else { 0.0 });
                 let raw = |k: usize| s[k][0] * r + s[k][1] * g + s[k][2] * b;
                 let (r0, r1, r2) = (raw(0), raw(1), raw(2));
@@ -359,7 +394,7 @@ unsafe fn camera<const K: usize, const NOISE: bool, const KEEP: bool>(buf: *mut 
                 }
                 // an 8/16-bit channel at its top was already clipped in the source (its white sits
                 // below full well in every camera): one stop over at Exposure 0, so it blooms and fringes
-                if !doc.linear && (*p >= 0.999 || (!doc.grey && (*p.add(1) >= 0.999 || *p.add(2) >= 0.999))) {
+                if clipped {
                     let t = 2.0 * doc.ev;
                     top = if t > top { t } else { top };
                 }
@@ -401,17 +436,26 @@ unsafe fn camera<const K: usize, const NOISE: bool, const KEEP: bool>(buf: *mut 
 /// `w × h` planes `cb` and `cr` are averaged over 2x2 blocks into `hb` and `hr`, blurred with
 /// radius `r` there and interpolated back. `tmp` is scratch of a half plane's size, `cols` of
 /// `3 × w` words (each column's two half-plane columns and its fraction, worked out once).
+/// `px`, `py` are the parities of the planes' first column and row in the image, so the 2x2
+/// blocks are the same ones in every band.
 ///
 /// # Safety
-/// `cb`, `cr` hold `w × h` floats, `hb`, `hr`, `tmp` at least `ceil(w/2) × ceil(h/2)`.
+/// `cb`, `cr` hold `w × h` floats, `hb`, `hr`, `tmp` at least `(w/2 + 1) × (h/2 + 1)`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn chroma_half(cb: *mut f32, cr: *mut f32, hb: *mut f32, hr: *mut f32, tmp: *mut f32, cols: *mut u32, w: usize, h: usize, r: usize) {
-    let (hw, hh) = (w.div_ceil(2), h.div_ceil(2));
+unsafe fn chroma_half(cb: *mut f32, cr: *mut f32, hb: *mut f32, hr: *mut f32, tmp: *mut f32, cols: *mut u32, w: usize, h: usize, px: usize, py: usize, r: usize) {
+    let (hw, hh) = ((w + px).div_ceil(2), (h + py).div_ceil(2));
+    // the plane's two pixels of half-plane pixel `i` (repeated at the plane's edges)
+    let pair = |i: usize, p: usize, len: usize| {
+        let a = (2 * i) as isize - p as isize;
+        let lo = if a < 0 { 0 } else { a as usize };
+        let hi = if a + 1 < len as isize { (a + 1) as usize } else { len - 1 };
+        (if lo < len { lo } else { len - 1 }, hi)
+    };
     unsafe {
         for y in 0..hh {
-            let (y0, y1) = (2 * y, if 2 * y + 1 < h { 2 * y + 1 } else { 2 * y });
+            let (y0, y1) = pair(y, py, h);
             for x in 0..hw {
-                let (x0, x1) = (2 * x, if 2 * x + 1 < w { 2 * x + 1 } else { 2 * x });
+                let (x0, x1) = pair(x, px, w);
                 let (a, b, c, d) = (y0 * w + x0, y0 * w + x1, y1 * w + x0, y1 * w + x1);
                 *hb.add(y * hw + x) = (*cb.add(a) + *cb.add(b) + *cb.add(c) + *cb.add(d)) * 0.25;
                 *hr.add(y * hw + x) = (*cr.add(a) + *cr.add(b) + *cr.add(c) + *cr.add(d)) * 0.25;
@@ -422,7 +466,7 @@ unsafe fn chroma_half(cb: *mut f32, cr: *mut f32, hb: *mut f32, hr: *mut f32, tm
         // back up by bilinear interpolation between half-plane centres
         let (cix, cjx, ctx) = (cols, cols.add(w), cols.add(2 * w) as *mut f32);
         for x in 0..w {
-            let fx = (x as f32 - 0.5) * 0.5;
+            let fx = ((x + px) as f32 - 0.5) * 0.5;
             let fx = if fx < 0.0 { 0.0 } else { fx };
             let ix = fx as usize;
             let (ix, jx, tx) = if ix + 1 < hw { (ix, ix + 1, fx - ix as f32) } else { (hw - 1, hw - 1, 0.0) };
@@ -431,7 +475,7 @@ unsafe fn chroma_half(cb: *mut f32, cr: *mut f32, hb: *mut f32, hr: *mut f32, tm
             *ctx.add(x) = tx;
         }
         for y in 0..h {
-            let fy = (y as f32 - 0.5) * 0.5;
+            let fy = ((y + py) as f32 - 0.5) * 0.5;
             let fy = if fy < 0.0 { 0.0 } else { fy };
             let iy = fy as usize;
             let (iy, jy, ty) = if iy + 1 < hh { (iy, iy + 1, fy - iy as f32) } else { (hh - 1, hh - 1, 0.0) };
@@ -515,22 +559,53 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     let (dec, denc) = unsafe { if space == b"Adobe RGB" { (a, a.add(TN + 1)) } else { (odec, enc) } };
     let linear_doc = depth == 32;
 
-    // planes: the camera's output as Y'CbCr, the blown-highlight map, two scratch, and for a
-    // Strength below 100 the document's linear values; then per-column scratch
-    let keep = strength < 1.0;
-    let area = w * h;
+    // Resolution "Camera": render at about the camera's megapixels, on f × f blocks of the
+    // document grid (whole blocks of document coordinates, so every band makes the same ones)
+    let f: usize = if json_str(json, "resolution") == Some(b"Document") {
+        1
+    } else {
+        let px = g("canvasWidth", 0.0) * g("canvasHeight", 0.0);
+        let r = sqrt(px / (cam.megapixels * 1e6));
+        ((r + 0.5) as usize).clamp(1, 4)
+    };
+    let fi = f as i32;
+    let (bx0, by0) = (x0.div_euclid(fi), y0.div_euclid(fi));
+    // the planes' size: the band's camera pixels
+    let (pw, ph) = if f == 1 { (w, h) } else { (((x0 + w as i32 - 1).div_euclid(fi) - bx0 + 1) as usize, ((y0 + h as i32 - 1).div_euclid(fi) - by0 + 1) as usize) };
+
+    // planes (pw × ph): the camera's output as Y'CbCr, the blown-highlight map, two scratch; for
+    // a Strength below 100 at f = 1 the document's linear values; at f > 1 the camera pixels'
+    // input. Then per-column scratch and the tables.
+    let mixing = strength < 1.0;
+    let keep = mixing && f == 1;
+    let area = pw * ph;
     let kn = if !keep { 0 } else if grey { 1 } else { 3 };
-    let planes_len = area * 4 * (6 + kn);
-    let mem = alloc((planes_len + w * 13 + 256 * 4 + (SH_LEN + 1) * 4 + LUT_LEN * 4) as u32) as usize;
+    let ln = if f > 1 { 4 } else { 0 };
+    // each plane with a little room beyond pw × ph: s1 holds both half-resolution chroma planes,
+    // which on tiny planes can be a few values more than one plane
+    let ps = area + 2 * (pw + ph) + 8;
+    let planes_len = ps * 4 * (6 + kn + ln);
+    let tail_len = pw * 12 + w * 40 + 256 * 4 + (SH_LEN + 1) * 4 + LUT_LEN * 4 + pw;
+    let mem = alloc((planes_len + tail_len) as u32) as usize;
     if mem == 0 {
         return ERR_MEMORY;
     }
-    let plane = |i: usize| (mem + area * 4 * i) as *mut f32;
+    let plane = |i: usize| (mem + ps * 4 * i) as *mut f32;
     let (py, pcb, pcr, blown, s1, s2) = (plane(0), plane(1), plane(2), plane(3), plane(4), plane(5));
-    let cols = (mem + planes_len) as *mut u32; // 3 × w words for the chroma upsampling
-    let dec8 = (mem + planes_len + w * 12) as *mut f32; // 256 floats
-    let sh = (mem + planes_len + w * 12 + 256 * 4) as *mut f32; // SH_LEN + 1 floats
-    let lut = (mem + planes_len + w * 12 + 256 * 4 + (SH_LEN + 1) * 4) as *mut f32; // LUT_LEN floats
+    let mut at = mem + planes_len;
+    let mut take = |bytes: usize| {
+        let p = at;
+        at += bytes;
+        p
+    };
+    let cols = take(pw * 12) as *mut u32; // 3 × pw words for the chroma upsampling
+    let upc = take(w * 12) as *mut u32; // 3 × w words for the upscaling (f > 1)
+    let lxs = take(w * 4) as *mut u32; // each document column's camera column (f > 1)
+    let rows = take(w * 24) as *mut f32; // two camera rows at document width, 3 values each (f > 1)
+    let dec8 = take(256 * 4) as *mut f32;
+    let sh = take((SH_LEN + 1) * 4) as *mut f32;
+    let lut = take(LUT_LEN * 4) as *mut f32;
+    let blown_cols = take(pw) as *mut u8; // pw flags (zeroed by memory.grow)
     // SAFETY: allocated above; the static LUT holds LUT_LEN u16
     unsafe {
         build_shaper(sh);
@@ -541,9 +616,9 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
             *lut.add(j) = *src.add(j) as f32 * (1.0 / 65535.0);
         }
     }
-    let blown_cols = (mem + planes_len + w * 12 + 256 * 4 + (SH_LEN + 1) * 4 + LUT_LEN * 4) as *mut u8; // w flags (zeroed by memory.grow)
     let k = |j: usize| if j < kn { plane(6 + j) } else { core::ptr::null_mut() };
-    let pl = Planes { y: py, cb: pcb, cr: pcr, blown, cols: blown_cols, keep: [k(0), k(1), k(2)] };
+    let inp = |j: usize| if j < ln { plane(6 + kn + j) } else { core::ptr::null_mut() };
+    let pl = Planes { inp: [inp(0), inp(1), inp(2), inp(3)], y: py, cb: pcb, cr: pcr, blown, cols: blown_cols, keep: [k(0), k(1), k(2)] };
     let dec8 = if depth == 8 {
         for l in 0..256 {
             // SAFETY: 256 floats allocated above
@@ -553,9 +628,57 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     } else {
         core::ptr::null()
     };
+    let doc = Doc { linear: linear_doc, grey, ident, n, dec, dec8, m_in, ev };
+
+    // ---------------------------------------------------------------- 0: camera pixels (f > 1)
+    if f > 1 {
+        let [ir, ig, ib, ic] = pl.inp;
+        // SAFETY: buf holds w × h × n samples, the input planes pw × ph floats (zeroed)
+        unsafe {
+            for x in 0..w {
+                *lxs.add(x) = ((x0 + x as i32).div_euclid(fi) - bx0) as u32;
+            }
+            // sums of the document's linear light per camera pixel, and of its clipped pixels
+            for y in 0..h {
+                let row = ((y0 + y as i32).div_euclid(fi) - by0) as usize * pw;
+                for x in 0..w {
+                    let p = buf.add((y * w + x) * n);
+                    let l = row + *lxs.add(x) as usize;
+                    *ir.add(l) += doc.lin(*p);
+                    if !grey {
+                        *ig.add(l) += doc.lin(*p.add(1));
+                        *ib.add(l) += doc.lin(*p.add(2));
+                    }
+                    if doc.clipped(p) {
+                        *ic.add(l) += 1.0;
+                    }
+                }
+            }
+            // the means (over the document pixels the band has of each block), in sRGB primaries
+            let span = |b: i32, o: i32, len: usize| {
+                let lo = if b * fi > o { b * fi } else { o };
+                let hi = if b * fi + fi - 1 < o + len as i32 - 1 { b * fi + fi - 1 } else { o + len as i32 - 1 };
+                (hi - lo + 1) as f32
+            };
+            for ly in 0..ph {
+                let cy = span(by0 + ly as i32, y0, h);
+                for lx in 0..pw {
+                    let inv = 1.0 / (cy * span(bx0 + lx as i32, x0, w));
+                    let l = ly * pw + lx;
+                    let r = *ir.add(l) * inv;
+                    let (gg, bb) = if grey { (r, r) } else { (*ig.add(l) * inv, *ib.add(l) * inv) };
+                    let (r, gg, bb) = if ident { (r, gg, bb) } else { mat(&m_in, r, gg, bb) };
+                    *ir.add(l) = r;
+                    *ig.add(l) = gg;
+                    *ib.add(l) = bb;
+                    *ic.add(l) *= inv;
+                }
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- 1-3: noise and the camera
-    let doc = Doc { linear: linear_doc, grey, ident, n, dec, dec8, m_in, ev };
+    let (sx0, sy0) = if f == 1 { (x0, y0) } else { (bx0, by0) };
     let sensor = Sensor {
         lut,
         sh,
@@ -573,58 +696,64 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         noise: NOISE_BYTES.0.as_ptr() as *const i8,
         ox,
         oy,
-        x0,
-        y0,
+        x0: sx0,
+        y0: sy0,
     };
-    // SAFETY: buf holds w × h × n samples, the planes w × h values each
+    // SAFETY: buf holds w × h × n samples, the planes pw × ph values each
     // every pixel takes the full path: sensor noise makes each one different, so a colour cache
     // (as in Marcs Film Emulator) misses too often to pay (tried: 30-50 % slower on photos)
     macro_rules! run {
-        ($k:literal, $noise:literal, $keep:literal) => {
-            camera::<$k, $noise, $keep>(buf, w, h, &doc, &sensor, &pl)
+        ($noise:literal, $keep:literal, $low:literal) => {
+            if cam.channels == 4 {
+                camera::<4, $noise, $keep, $low>(buf, pw, ph, &doc, &sensor, &pl)
+            } else {
+                camera::<3, $noise, $keep, $low>(buf, pw, ph, &doc, &sensor, &pl)
+            }
         };
     }
     let bbox = unsafe {
-        match (cam.channels, noise_amt > 0.0, keep) {
-            (4, true, false) => run!(4, true, false),
-            (4, false, false) => run!(4, false, false),
-            (4, true, true) => run!(4, true, true),
-            (4, false, true) => run!(4, false, true),
-            (_, true, false) => run!(3, true, false),
-            (_, false, false) => run!(3, false, false),
-            (_, true, true) => run!(3, true, true),
-            (_, false, true) => run!(3, false, true),
+        match (noise_amt > 0.0, keep, f > 1) {
+            (true, false, false) => run!(true, false, false),
+            (false, false, false) => run!(false, false, false),
+            (true, true, _) => run!(true, true, false),
+            (false, true, _) => run!(false, true, false),
+            (true, false, true) => run!(true, false, true),
+            (false, false, true) => run!(false, false, true),
         }
     };
 
     unsafe {
-        if let Some((bx0, bx1, by0, by1)) = bbox {
+        if let Some((ax0, ax1, ay0, ay1)) = bbox {
             // ---------------------------------------------------------------- 4: blooming
             // charge spilling along the column, both ways, falling off over `reach` pixels; reach
             // and amount are kept inside the overlap so bands meet without seams. Only columns
             // with a blown pixel get any (the others would add exactly nothing). In Y'CbCr, mixing
             // r, g, b towards white by `s` is Y towards 1 and Cb, Cr towards 0.
             if bloom_amt > 0.0 {
-                // reach <= 7 px: falls below 1 % within the 32 px overlap
-                let reach = 3.0 + 3.0 * bloom_amt;
-                let reach = if reach > 7.0 { 7.0 } else { reach };
+                // reach <= 7 document px: falls below 1 % within the 32 px overlap; in camera
+                // pixels 1/f of it, with the spill per pixel f times as strong
+                let reach_doc = 3.0 + 3.0 * bloom_amt;
+                let reach_doc = if reach_doc > 7.0 { 7.0 } else { reach_doc };
+                let reach = reach_doc / f as f32;
+                let reach = if reach > 1.0 { reach } else { 1.0 };
+                let gain = 0.08 * bloom_amt * reach_doc / reach;
                 let keep_ = 1.0 - 1.0 / reach;
-                for x in bx0..=bx1 {
+                for x in ax0..=ax1 {
                     if *blown_cols.add(x) == 0 {
                         continue;
                     }
                     let mut acc = 0.0f32;
-                    for y in 0..h {
-                        acc = acc * keep_ + *blown.add(y * w + x);
-                        *s1.add(y * w + x) = acc;
+                    for y in 0..ph {
+                        acc = acc * keep_ + *blown.add(y * pw + x);
+                        *s1.add(y * pw + x) = acc;
                     }
                     acc = 0.0;
-                    for y in (0..h).rev() {
-                        let e = *blown.add(y * w + x);
+                    for y in (0..ph).rev() {
+                        let e = *blown.add(y * pw + x);
                         acc = acc * keep_ + e;
-                        let streak = (*s1.add(y * w + x) + acc - e) * (0.08 * bloom_amt);
+                        let streak = (*s1.add(y * pw + x) + acc - e) * gain;
                         let s = if streak < 1.0 { streak } else { 1.0 };
-                        let i = y * w + x;
+                        let i = y * pw + x;
                         *py.add(i) += (1.0 - *py.add(i)) * s;
                         *pcb.add(i) *= 1.0 - s;
                         *pcr.add(i) *= 1.0 - s;
@@ -636,15 +765,16 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
             // on the blown pixels' bounding box plus a margin beyond the blur's reach (4 px)
             if fringe_amt > 0.0 {
                 const M: usize = 6;
-                let (xa, xb) = (bx0.saturating_sub(M), (bx1 + M).min(w - 1));
-                let (ya, yb) = (by0.saturating_sub(M), (by1 + M).min(h - 1));
+                let (xa, xb) = (ax0.saturating_sub(M), (ax1 + M).min(pw - 1));
+                let (ya, yb) = (ay0.saturating_sub(M), (ay1 + M).min(ph - 1));
                 for y in ya..=yb {
                     for x in xa..=xb {
-                        let e = *blown.add(y * w + x);
-                        *s1.add(y * w + x) = if e > 1.0 { 1.0 } else { e };
+                        let e = *blown.add(y * pw + x);
+                        *s1.add(y * pw + x) = if e > 1.0 { 1.0 } else { e };
                     }
                 }
-                blur_rect(s1.add(ya * w + xa), s2.add(ya * w + xa), w, xb - xa + 1, yb - ya + 1, 2);
+                // 2 document px wide; a camera pixel is wider already
+                blur_rect(s1.add(ya * pw + xa), s2.add(ya * pw + xa), pw, xb - xa + 1, yb - ya + 1, if f == 1 { 2 } else { 1 });
                 // the fringe's colour (r +0.45, g -0.08, b +0.85 per unit) in Y'CbCr
                 const FR: f32 = 0.45;
                 const FG: f32 = -0.08;
@@ -652,7 +782,7 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
                 const FY: f32 = 0.299 * FR + 0.587 * FG + 0.114 * FB;
                 for y in ya..=yb {
                     for x in xa..=xb {
-                        let i = y * w + x;
+                        let i = y * pw + x;
                         let e = *blown.add(i);
                         let edge = *s1.add(i) - if e > 1.0 { 1.0 } else { e }; // the dark side of the edge
                         if edge > 0.0 {
@@ -667,11 +797,16 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         }
 
         // ---------------------------------------------------------------- 6: noise reduction, sharpening
-        // chroma at half resolution and blurred (the cameras' main weapon against colour noise)
+        // chroma at half resolution and blurred (the cameras' main weapon against colour noise);
+        // the radius in document px, so at f > 1 in camera pixels 1/f of it, within the overlap
         let rc = (nr_amt * 1.25 + 0.5) as usize;
         let rc = if rc > 6 { 6 } else { rc };
-        let half = w.div_ceil(2) * h.div_ceil(2);
-        chroma_half(pcb, pcr, s1, s1.add(half), s2, cols, w, h, rc);
+        let rc = if f == 1 { rc } else { ((rc as f32 / f as f32 + 0.5) as usize).min((ov / f).saturating_sub(4) / 4) };
+        // the 2x2 blocks on the image's grid (planes start at x0, y0 or the block bx0, by0)
+        let (gx, gy) = if f == 1 { (x0, y0) } else { (bx0, by0) };
+        let (px_, py_) = ((gx & 1) as usize, (gy & 1) as usize);
+        let half = (pw + px_).div_ceil(2) * (ph + py_).div_ceil(2);
+        chroma_half(pcb, pcr, s1, s1.add(half), s2, cols, pw, ph, px_, py_, rc);
         // luma, against one blur of itself: softened towards it at higher noise reduction (the
         // "watercolour"), then sharpened away from it (unsharp mask, with its halos)
         let wl = (nr_amt - 0.6) * 0.35;
@@ -679,12 +814,12 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         if wl > 0.0 || sharpen_amt > 0.0 {
             let rs = (cam.sharpen_radius + 0.5) as usize;
             if rs <= 1 {
-                blur1(py, s1, s2, w, h);
+                blur1(py, s1, s2, pw, ph);
             } else {
                 for i in 0..area {
                     *s1.add(i) = *py.add(i);
                 }
-                blur(s1, s2, w, h, rs);
+                blur(s1, s2, pw, ph, rs);
             }
             let k = sharpen_amt * 1.6;
             for i in 0..area {
@@ -699,49 +834,167 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         }
 
         // ---------------------------------------------------------------- 7: back, Strength, write
-        let direct = !linear_doc && ident && !grey && strength >= 1.0;
+        let direct = !linear_doc && ident && !grey && !mixing;
         let [k0, k1, k2] = pl.keep;
-        for y in ov..h - ov {
-            for x in ov..w - ov {
-                let i = y * w + x;
-                let p = buf.add(i * n);
-                if alpha && *p.add(n - 1) <= 0.0 {
-                    continue;
+        // one pixel: the camera's Y'CbCr (sRGB-encoded) into the document, mixed by Strength
+        // with the original (from the planes at `i` with `keep`, else decoded from `p`)
+        let put = |p: *mut f32, i: usize, yy: f32, cb: f32, cr: f32| {
+            let er = yy + cr;
+            let eb = yy + cb;
+            let eg = (yy - 0.299 * er - 0.114 * eb) / 0.587;
+            if direct {
+                // the camera's output is sRGB-encoded, like the document
+                *p = clamp01(er);
+                *p.add(1) = clamp01(eg);
+                *p.add(2) = clamp01(eb);
+                return;
+            }
+            // camera output (sRGB-encoded) -> linear sRGB
+            let (cr_, cg_, cb_) = (lerp_tab(odec, er), lerp_tab(odec, eg), lerp_tab(odec, eb));
+            if grey {
+                let c = 0.2126 * cr_ + 0.7152 * cg_ + 0.0722 * cb_;
+                let v = if mixing {
+                    let o = if keep { *k0.add(i) } else { doc.lin(*p) };
+                    o + (c - o) * strength
+                } else {
+                    c
+                };
+                *p = if linear_doc { v } else { lerp_tab(denc, v) };
+            } else {
+                // the camera's output is sRGB; into the document's primaries
+                let (tr, tg, tb) = if ident { (cr_, cg_, cb_) } else { mat(&m_out, cr_, cg_, cb_) };
+                let (vr, vg, vb) = if mixing {
+                    let (or, og, ob) = if keep { (*k0.add(i), *k1.add(i), *k2.add(i)) } else { (doc.lin(*p), doc.lin(*p.add(1)), doc.lin(*p.add(2))) };
+                    (or + (tr - or) * strength, og + (tg - og) * strength, ob + (tb - ob) * strength)
+                } else {
+                    (tr, tg, tb)
+                };
+                if linear_doc {
+                    *p = vr;
+                    *p.add(1) = vg;
+                    *p.add(2) = vb;
+                } else {
+                    *p = lerp_tab(denc, vr);
+                    *p.add(1) = lerp_tab(denc, vg);
+                    *p.add(2) = lerp_tab(denc, vb);
                 }
+            }
+        };
+        if f == 1 {
+            for y in ov..h - ov {
+                for x in ov..w - ov {
+                    let i = y * w + x;
+                    let p = buf.add(i * n);
+                    if alpha && *p.add(n - 1) <= 0.0 {
+                        continue;
+                    }
+                    put(p, i, *py.add(i), *pcb.add(i), *pcr.add(i));
+                }
+            }
+        } else {
+            // the camera's result per camera pixel in the form the document takes: sRGB-encoded
+            // (direct), else linear light in the document's primaries (grey: its luminance)
+            for i in 0..area {
                 let (yy, cb, cr) = (*py.add(i), *pcb.add(i), *pcr.add(i));
                 let er = yy + cr;
                 let eb = yy + cb;
                 let eg = (yy - 0.299 * er - 0.114 * eb) / 0.587;
-                if direct {
-                    // the camera's output is sRGB-encoded, like the document
-                    *p = clamp01(er);
-                    *p.add(1) = clamp01(eg);
-                    *p.add(2) = clamp01(eb);
-                    continue;
-                }
-                // camera output (sRGB-encoded) -> linear sRGB
-                let (cr_, cg_, cb_) = (lerp_tab(odec, er), lerp_tab(odec, eg), lerp_tab(odec, eb));
-                if grey {
-                    let c = 0.2126 * cr_ + 0.7152 * cg_ + 0.0722 * cb_;
-                    let v = if keep { let o = *k0.add(i); o + (c - o) * strength } else { c };
-                    *p = if linear_doc { v } else { lerp_tab(denc, v) };
+                let (a, b, c) = if direct {
+                    (er, eg, eb)
                 } else {
-                    // the camera's output is sRGB; into the document's primaries
-                    let (tr, tg, tb) = if ident { (cr_, cg_, cb_) } else { mat(&m_out, cr_, cg_, cb_) };
-                    let (vr, vg, vb) = if keep {
-                        let (or, og, ob) = (*k0.add(i), *k1.add(i), *k2.add(i));
-                        (or + (tr - or) * strength, og + (tg - og) * strength, ob + (tb - ob) * strength)
+                    let (lr, lg, lb) = (lerp_tab(odec, er), lerp_tab(odec, eg), lerp_tab(odec, eb));
+                    if grey {
+                        (0.2126 * lr + 0.7152 * lg + 0.0722 * lb, 0.0, 0.0)
+                    } else if ident {
+                        (lr, lg, lb)
                     } else {
-                        (tr, tg, tb)
+                        mat(&m_out, lr, lg, lb)
+                    }
+                };
+                *py.add(i) = a;
+                *pcb.add(i) = b;
+                *pcr.add(i) = c;
+            }
+            // scaled back up, bilinear between camera-pixel centres: along x once per camera row
+            // (two rows kept, at document width), along y per document pixel
+            let inv_f = 1.0 / f as f32;
+            let at_ = |d: i32, b0: i32, len: usize| -> (usize, usize, f32) {
+                let u = (d as f32 + 0.5) * inv_f - 0.5 - b0 as f32;
+                let u = if u > 0.0 { u } else { 0.0 };
+                let i = u as usize;
+                if i + 1 < len { (i, i + 1, u - i as f32) } else { (len - 1, len - 1, 0.0) }
+            };
+            let (uix, ujx, utx) = (upc, upc.add(w), upc.add(2 * w) as *mut f32);
+            for x in ov..w - ov {
+                let (i, j, t) = at_(x0 + x as i32, bx0, pw);
+                *uix.add(x) = i as u32;
+                *ujx.add(x) = j as u32;
+                *utx.add(x) = t;
+            }
+            let nc = if grey { 1 } else { 3 };
+            let planes3 = [py, pcb, pcr];
+            // a camera row along x into `dst` ([x][c], document width)
+            let widen = |ly: usize, dst: *mut f32| {
+                for x in ov..w - ov {
+                    let (ix, jx, tx) = (*uix.add(x) as usize, *ujx.add(x) as usize, *utx.add(x));
+                    for (c, q) in planes3.iter().enumerate().take(nc) {
+                        let (a, b) = (*q.add(ly * pw + ix), *q.add(ly * pw + jx));
+                        *dst.add(x * 3 + c) = a + (b - a) * tx;
+                    }
+                }
+            };
+            let (mut ra, mut rb) = (rows, rows.add(w * 3));
+            let (mut la, mut lb) = (usize::MAX, usize::MAX);
+            for y in ov..h - ov {
+                let (iy, jy, ty) = at_(y0 + y as i32, by0, ph);
+                if la != iy {
+                    if lb == iy {
+                        core::mem::swap(&mut ra, &mut rb);
+                        la = iy;
+                        lb = usize::MAX;
+                    } else {
+                        widen(iy, ra);
+                        la = iy;
+                    }
+                }
+                if lb != jy {
+                    widen(jy, rb);
+                    lb = jy;
+                }
+                for x in ov..w - ov {
+                    let p = buf.add((y * w + x) * n);
+                    if alpha && *p.add(n - 1) <= 0.0 {
+                        continue;
+                    }
+                    let v = |c: usize| {
+                        let a = *ra.add(x * 3 + c);
+                        a + (*rb.add(x * 3 + c) - a) * ty
                     };
-                    if linear_doc {
-                        *p = vr;
-                        *p.add(1) = vg;
-                        *p.add(2) = vb;
+                    if direct {
+                        *p = clamp01(v(0));
+                        *p.add(1) = clamp01(v(1));
+                        *p.add(2) = clamp01(v(2));
+                    } else if grey {
+                        let c = v(0);
+                        let c = if mixing { let o = doc.lin(*p); o + (c - o) * strength } else { c };
+                        *p = if linear_doc { c } else { lerp_tab(denc, c) };
                     } else {
-                        *p = lerp_tab(denc, vr);
-                        *p.add(1) = lerp_tab(denc, vg);
-                        *p.add(2) = lerp_tab(denc, vb);
+                        let (tr, tg, tb) = (v(0), v(1), v(2));
+                        let (vr, vg, vb) = if mixing {
+                            let (or, og, ob) = (doc.lin(*p), doc.lin(*p.add(1)), doc.lin(*p.add(2)));
+                            (or + (tr - or) * strength, og + (tg - og) * strength, ob + (tb - ob) * strength)
+                        } else {
+                            (tr, tg, tb)
+                        };
+                        if linear_doc {
+                            *p = vr;
+                            *p.add(1) = vg;
+                            *p.add(2) = vb;
+                        } else {
+                            *p = lerp_tab(denc, vr);
+                            *p.add(1) = lerp_tab(denc, vg);
+                            *p.add(2) = lerp_tab(denc, vb);
+                        }
                     }
                 }
             }

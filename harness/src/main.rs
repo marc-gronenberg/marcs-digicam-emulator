@@ -290,14 +290,6 @@ mod tests {
         v.iter().map(|v: &f32| (v * 255.0).round() / 255.0).collect()
     }
 
-    fn inner(data: &[f32], w: usize, h: usize, ov: usize) -> Vec<f32> {
-        let mut out = vec![];
-        for y in ov..h - ov {
-            out.extend_from_slice(&data[(y * w + ov) * 4..(y * w + w - ov) * 4]);
-        }
-        out
-    }
-
     fn luma(p: &[f32]) -> f32 {
         0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
     }
@@ -440,5 +432,74 @@ mod tests {
             d[i + 2] - d[i + 1]
         };
         assert!(violet(&on) > violet(&off) + 0.03, "no purple fringe: {} vs {} without", violet(&on), violet(&off));
+    }
+
+    /// Runs a band of `w × h` RGBA pixels at (`x`, `y`) of a `cw × ch` canvas, 8-bit.
+    #[allow(clippy::too_many_arguments)]
+    fn run_on_canvas(host: &Host, data: &mut [f32], w: usize, h: usize, ov: usize, x: i32, y: i32, cw: usize, ch: usize, params: &str) {
+        let p = format!(r#"{{"_image":{{"x":{x},"y":{y},"width":{w},"height":{h},"overlap":{ov},"canvasWidth":{cw},"canvasHeight":{ch}}},{}"#, &params[1..]);
+        host.filter(data, w as u32, h as u32, 4, 8 | RGBA, p.as_bytes()).expect("filter");
+    }
+
+    /// Resolution "Camera" on a 24 MP canvas (Pocket 2002: blocks of 3 x 3): two bands whose
+    /// origins put the block grid (and the chroma's 2x2 grid) at different offsets render the
+    /// pixels they share the same way, noise, blooming and fringing included: bands meet without seams.
+    #[test]
+    fn camera_resolution_bands_agree() {
+        let cam = host("marcs-digicam-emulator.wasm");
+        let (w, h, ov) = (200usize, 160usize, 32usize);
+        let px = |gx: i32, gy: i32| -> [f32; 4] {
+            if (100..106).contains(&gx) && (80..86).contains(&gy) {
+                return [1.0; 4]; // a clipped highlight
+            }
+            let v = ((gx * 7 + gy * 13).rem_euclid(64) as f32 / 63.0) * 0.6 + 0.2 * ((gx / 9 + gy / 5).rem_euclid(2)) as f32;
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0;
+            [q(v), q(v * 0.8), q(1.0 - v), 1.0]
+        };
+        let band = |bx: i32, by: i32| -> Vec<f32> {
+            let mut v = Vec::with_capacity(w * h * 4);
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    v.extend_from_slice(&px(bx + x, by + y));
+                }
+            }
+            v
+        };
+        let params = r#"{"camera":"Pocket 2002","iso":"800"}"#;
+        let (ax, ay, bx, by) = (0, 0, 21, 13);
+        let (mut a, mut b) = (band(ax, ay), band(bx, by));
+        run_on_canvas(&cam, &mut a, w, h, ov, ax, ay, 6000, 4000, params);
+        run_on_canvas(&cam, &mut b, w, h, ov, bx, by, 6000, 4000, params);
+        let mut worst = 0.0f32;
+        for gy in by + ov as i32..ay + (h - ov) as i32 {
+            for gx in bx + ov as i32..ax + (w - ov) as i32 {
+                let ia = (((gy - ay) as usize) * w + (gx - ax) as usize) * 4;
+                let ib = (((gy - by) as usize) * w + (gx - bx) as usize) * 4;
+                for c in 0..3 {
+                    worst = worst.max((a[ia + c] - b[ib + c]).abs() * 255.0);
+                }
+            }
+        }
+        assert!(worst < 1.5, "bands disagree by {worst} levels");
+    }
+
+    /// Resolution "Camera" renders at about the camera's size: on a 24 MP canvas a one-pixel
+    /// checkerboard (finer than the camera's pixels) is averaged away; "Document" keeps it.
+    #[test]
+    fn camera_resolution_softens_detail_finer_than_the_camera() {
+        let cam = host("marcs-digicam-emulator.wasm");
+        let (w, h) = (128usize, 64usize);
+        let checker: Vec<f32> = (0..w * h).flat_map(|i| {
+            let v = if (i % w + i / w) % 2 == 0 { 0.3 } else { 0.7 };
+            [v, v, v, 1.0]
+        }).collect();
+        let quiet = r#""camera":"Compact 2004","noise":0,"sharpening":0,"noiseReduction":0"#;
+        let mut camera = checker.clone();
+        run_on_canvas(&cam, &mut camera, w, h, 0, 0, 0, 6000, 4000, &format!("{{{quiet}}}"));
+        let mut document = checker.clone();
+        run_on_canvas(&cam, &mut document, w, h, 0, 0, 0, 6000, 4000, &format!(r#"{{{quiet},"resolution":"Document"}}"#));
+        let (sc, sd) = (std_luma(&camera) * 255.0, std_luma(&document) * 255.0);
+        assert!(sd > 40.0, "Document lost the checkerboard: {sd} levels");
+        assert!(sc < 2.0, "Camera kept the checkerboard: {sc} levels");
     }
 }
