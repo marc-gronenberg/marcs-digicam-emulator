@@ -1,4 +1,4 @@
-# Marcs Digicam Emulator (v0.2.0)
+# Marcs Digicam Emulator (v0.3.0)
 
 The look of 2000s CCD compact cameras for **PhotoCraft**, as one WebAssembly filter plug-in
 (plug-in ABI v1): eight cameras from 2002 to 2009, each a modelled CCD sensor (primary RGB or
@@ -58,7 +58,7 @@ for, not any single model.
 | Parameter | Range | Default | What it does |
 |---|---|---|---|
 | Camera | the eight above | Compact 2004 | The camera |
-| Resolution | Camera / Document | Camera | **Camera** renders at about the camera's megapixels and scales back up: softer, with the camera's coarser noise grain, and 2–3× faster on large photos. **Document** renders every pixel |
+| Resolution | Camera / Low / Document | Camera | **Camera** renders at about the camera's megapixels and scales back up: softer, with the camera's coarser noise grain, and 2–3× faster on large photos. **Low** one block size coarser (up to 4 × 4): softer still, about twice as fast again. **Document** renders every pixel |
 | Input Space | sRGB / Display P3 / Adobe RGB | sRGB | The document's colour space |
 | Exposure | −2 … +2 EV | 0 | Exposure compensation *into* the camera: more blows highlights the digital way |
 | ISO | 100 … 1600 | 100 | Sensor gain: more noise, and more noise reduction to fight it |
@@ -108,20 +108,25 @@ purple fringing (a violet halo on the dark side of blown edges), noise reduction
 half resolution, as the cameras' 4:2:0 JPEGs stored it, and blurred there; luma softened at high
 ISO) and sharpening (unsharp mask on luma with a small threshold).
 
-**Resolution.** With Camera, the plug-in first makes the camera's pixels: each one the mean, in
-linear light, of a block of f × f document pixels, f a whole number (1–4) from the photo's and the
-camera's megapixels. A 10 MP camera on a 24 MP photo uses blocks of 2 × 2, the 2 MP camera 3 × 3.
+**Resolution.** With Camera, the plug-in first makes the camera's pixels: each one the mean of a
+block of f × f document pixels (of their encoded values, decoded once per block: faster, a little
+darker on fine bright detail than light would average), f a whole number (1–4) from the photo's and
+the camera's megapixels. A 10 MP camera on a 24 MP photo uses blocks of 2 × 2, the 2 MP camera
+3 × 3; Low one size more, up to 4 × 4.
 Everything above then runs on these pixels, as in the camera: noise per camera pixel, chroma at
 half the camera's resolution, sharpening halos a camera pixel wide. The result is scaled back up
 bilinearly. The blocks sit on the photo's grid, so the bands PhotoCraft hands the plug-in meet
-without seams. The spatial stages keep their size in document pixels.
+without seams. The spatial stages keep their size in document pixels, within the 16 px band
+overlap: blooming reaches about 3.5 px with a streak as bright at the light as a longer one, and
+the chroma blur at most 3 px (14 px reach), so very high noise reduction leaves a little more
+colour noise than a wider blur would.
 
 ## Limits
 
 - The sensors are models, not measurements; the makers' processing is unpublished and modelled.
 - **No full-height smear.** A real CCD smears a bright light into a vertical line over the whole
   frame; a PhotoCraft plug-in sees the image in bands of 256 rows, so only the local blooming
-  (up to about 20 px) is possible.
+  (about 10 px) is possible.
 - Resolution Camera meets the camera's size only roughly, in whole-number blocks: a 10 MP camera
   on a 24 MP photo renders at 6 MP, the 2 MP camera at 2.7 MP. It needs PhotoCraft to tell the
   plug-in the photo's size; without it, it renders like Document.
@@ -129,9 +134,10 @@ without seams. The spatial stages keep their size in document pixels.
 - Noise added in the shadows is clipped at black like in the cameras, which lifts deep shadows a
   little at ISO 800 and 1600.
 - No JPEG artefacts or date stamp (yet).
-- Speed, on a 24 MP photo with two threads in the test host: Resolution Camera about 12 s for
-  the 5–10 MP cameras (blocks of 2 × 2) and about 9 s for the 2 MP one (3 × 3); Document about
-  30 s. A Strength below 100 or a Display P3 / Adobe RGB document adds about a third. Every pixel
+- Speed, on a 24 MP photo with two threads in the test host: Resolution Camera about 10 s for
+  the 5–10 MP cameras (blocks of 2 × 2) and about 6.5 s for the 2 MP one (3 × 3); Low about
+  6 s and 5 s; Document about 25 s. A Strength below 100 or a Display P3 / Adobe RGB document
+  adds about a third. Every pixel
   takes the full path (noise makes each one different, so a colour cache like the film
   emulator's misses too often: tried, 30–50 % slower); PhotoCraft runs four bands at once.
 - RGB and Grayscale only.

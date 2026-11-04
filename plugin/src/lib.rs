@@ -1,6 +1,6 @@
 //! Marcs Digicam Emulator: the look of 2000s CCD compact cameras for PhotoCraft (plug-in ABI v1).
 //!
-//! Per band (with a 32 px overlap, for the spatial stages):
+//! Per band (with a 16 px overlap, for the spatial stages):
 //!
 //! 0. Resolution "Camera" (the default): the band is rendered at about the camera's megapixels,
 //!    each camera pixel the mean, in linear light, of an f × f block of the document grid (f a
@@ -34,13 +34,13 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 const MANIFEST: &str = r#"{
   "id": "io.marcs.digicam",
   "name": "Marcs Digicam Emulator…",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "kind": "filter",
   "author": "Marc Gronenberg",
   "description": "The look of 2000s CCD compact cameras: sensor colour, hard digital highlights, sensor noise by ISO, noise reduction, oversharpening, blooming and purple fringing, at the camera's resolution. RGB and Grayscale.",
   "params": {
     "camera":     {"type": "choice", "options": ["Pocket 2002", "Prosumer 2003", "Compact 2004", "Compact 2005", "Compact 2006", "Compact 2007", "Ultracompact 2008", "Prosumer 2009"], "default": "Compact 2004"},
-    "resolution": {"type": "choice", "options": ["Camera", "Document"], "default": "Camera"},
+    "resolution": {"type": "choice", "options": ["Camera", "Low", "Document"], "default": "Camera"},
     "inputSpace": {"type": "choice", "options": ["sRGB", "Display P3", "Adobe RGB"], "default": "sRGB"},
     "exposure":   {"type": "number", "min": -2, "max": 2, "default": 0, "unit": "EV"},
     "iso":        {"type": "choice", "options": ["100", "200", "400", "800", "1600"], "default": "100"},
@@ -52,11 +52,11 @@ const MANIFEST: &str = r#"{
     "purpleFringing": {"type": "number", "min": 0, "max": 200, "default": 100},
     "seed":       {"type": "int", "min": 0, "max": 9999, "default": 1}
   },
-  "overlap": 32,
+  "overlap": 16,
   "area": "content"
 }"#;
 
-const OVERLAP: usize = 32;
+const OVERLAP: usize = 16;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_abi_version() -> u32 {
@@ -560,13 +560,16 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     let linear_doc = depth == 32;
 
     // Resolution "Camera": render at about the camera's megapixels, on f × f blocks of the
-    // document grid (whole blocks of document coordinates, so every band makes the same ones)
-    let f: usize = if json_str(json, "resolution") == Some(b"Document") {
+    // document grid (whole blocks of document coordinates, so every band makes the same ones);
+    // "Low" one block size coarser, for speed
+    let res = json_str(json, "resolution");
+    let f: usize = if res == Some(b"Document") {
         1
     } else {
         let px = g("canvasWidth", 0.0) * g("canvasHeight", 0.0);
         let r = sqrt(px / (cam.megapixels * 1e6));
-        ((r + 0.5) as usize).clamp(1, 4)
+        let fc = ((r + 0.5) as usize).clamp(1, 4);
+        if res == Some(b"Low") { (fc + 1).min(4) } else { fc }
     };
     let fi = f as i32;
     let (bx0, by0) = (x0.div_euclid(fi), y0.div_euclid(fi));
@@ -638,16 +641,18 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
             for x in 0..w {
                 *lxs.add(x) = ((x0 + x as i32).div_euclid(fi) - bx0) as u32;
             }
-            // sums of the document's linear light per camera pixel, and of its clipped pixels
+            // sums of the document's values per camera pixel (encoded: decoded once per block, a
+            // little darker on fine bright detail than light would average, and faster), and of
+            // its clipped pixels
             for y in 0..h {
                 let row = ((y0 + y as i32).div_euclid(fi) - by0) as usize * pw;
                 for x in 0..w {
                     let p = buf.add((y * w + x) * n);
                     let l = row + *lxs.add(x) as usize;
-                    *ir.add(l) += doc.lin(*p);
+                    *ir.add(l) += *p;
                     if !grey {
-                        *ig.add(l) += doc.lin(*p.add(1));
-                        *ib.add(l) += doc.lin(*p.add(2));
+                        *ig.add(l) += *p.add(1);
+                        *ib.add(l) += *p.add(2);
                     }
                     if doc.clipped(p) {
                         *ic.add(l) += 1.0;
@@ -665,8 +670,8 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
                 for lx in 0..pw {
                     let inv = 1.0 / (cy * span(bx0 + lx as i32, x0, w));
                     let l = ly * pw + lx;
-                    let r = *ir.add(l) * inv;
-                    let (gg, bb) = if grey { (r, r) } else { (*ig.add(l) * inv, *ib.add(l) * inv) };
+                    let r = doc.lin(*ir.add(l) * inv);
+                    let (gg, bb) = if grey { (r, r) } else { (doc.lin(*ig.add(l) * inv), doc.lin(*ib.add(l) * inv)) };
                     let (r, gg, bb) = if ident { (r, gg, bb) } else { mat(&m_in, r, gg, bb) };
                     *ir.add(l) = r;
                     *ig.add(l) = gg;
@@ -730,13 +735,14 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
             // with a blown pixel get any (the others would add exactly nothing). In Y'CbCr, mixing
             // r, g, b towards white by `s` is Y towards 1 and Cb, Cr towards 0.
             if bloom_amt > 0.0 {
-                // reach <= 7 document px: falls below 1 % within the 32 px overlap; in camera
+                // reach <= 3.5 document px: falls below 1 % within the 16 px overlap; in camera
                 // pixels 1/f of it, with the spill per pixel f times as strong
-                let reach_doc = 3.0 + 3.0 * bloom_amt;
-                let reach_doc = if reach_doc > 7.0 { 7.0 } else { reach_doc };
+                let reach_doc = 1.5 + 1.5 * bloom_amt;
+                let reach_doc = if reach_doc > 3.5 { 3.5 } else { reach_doc };
                 let reach = reach_doc / f as f32;
                 let reach = if reach > 1.0 { reach } else { 1.0 };
-                let gain = 0.08 * bloom_amt * reach_doc / reach;
+                // twice the spill per pixel of a 7 px reach, so the streak is as bright at the light
+                let gain = 0.16 * bloom_amt * reach_doc / reach;
                 let keep_ = 1.0 - 1.0 / reach;
                 for x in ax0..=ax1 {
                     if *blown_cols.add(x) == 0 {
@@ -801,7 +807,9 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         // the radius in document px, so at f > 1 in camera pixels 1/f of it, within the overlap
         let rc = (nr_amt * 1.25 + 0.5) as usize;
         let rc = if rc > 6 { 6 } else { rc };
-        let rc = if f == 1 { rc } else { ((rc as f32 / f as f32 + 0.5) as usize).min((ov / f).saturating_sub(4) / 4) };
+        let rc = if f == 1 { rc } else { (rc as f32 / f as f32 + 0.5) as usize };
+        // reach 4 rc + 2 camera px within the overlap (16 px: up to 3 at f = 1, 1 at f = 2)
+        let rc = rc.min((ov / f).saturating_sub(4) / 4);
         // the 2x2 blocks on the image's grid (planes start at x0, y0 or the block bx0, by0)
         let (gx, gy) = if f == 1 { (x0, y0) } else { (bx0, by0) };
         let (px_, py_) = ((gx & 1) as usize, (gy & 1) as usize);
@@ -843,10 +851,11 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
             let eb = yy + cb;
             let eg = (yy - 0.299 * er - 0.114 * eb) / 0.587;
             if direct {
-                // the camera's output is sRGB-encoded, like the document
-                *p = clamp01(er);
-                *p.add(1) = clamp01(eg);
-                *p.add(2) = clamp01(eb);
+                // the camera's output is sRGB-encoded, like the document (the host clamps 8/16-bit
+                // results to 0..1 itself)
+                *p = er;
+                *p.add(1) = eg;
+                *p.add(2) = eb;
                 return;
             }
             // camera output (sRGB-encoded) -> linear sRGB
@@ -971,9 +980,10 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
                         a + (*rb.add(x * 3 + c) - a) * ty
                     };
                     if direct {
-                        *p = clamp01(v(0));
-                        *p.add(1) = clamp01(v(1));
-                        *p.add(2) = clamp01(v(2));
+                        // the host clamps 8/16-bit results to 0..1 itself
+                        *p = v(0);
+                        *p.add(1) = v(1);
+                        *p.add(2) = v(2);
                     } else if grey {
                         let c = v(0);
                         let c = if mixing { let o = doc.lin(*p); o + (c - o) * strength } else { c };

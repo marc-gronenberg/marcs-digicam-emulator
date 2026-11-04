@@ -411,8 +411,8 @@ mod tests {
         let px = |x: usize, y: usize| luma(&out[(y * w + x) * 4..]);
         let (cx, cy) = (w / 2, h / 2);
         assert!(px(cx, cy) > 0.97, "the blown disc is {}", px(cx, cy));
-        // the disc's radius is 20 px: 8 px beyond its edge, above vs. beside it
-        let (above, beside) = (px(cx, cy - 28), px(cx + 28, cy));
+        // the disc's radius is 20 px: 4 px beyond its edge (the streak reaches ~3.5 px), above vs. beside it
+        let (above, beside) = (px(cx, cy - 24), px(cx + 24, cy));
         assert!(above > beside + 0.05, "no vertical bloom: above {above}, beside {beside}");
     }
 
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn camera_resolution_bands_agree() {
         let cam = host("marcs-digicam-emulator.wasm");
-        let (w, h, ov) = (200usize, 160usize, 32usize);
+        let (w, h, ov) = (200usize, 160usize, 16usize);
         let px = |gx: i32, gy: i32| -> [f32; 4] {
             if (100..106).contains(&gx) && (80..86).contains(&gy) {
                 return [1.0; 4]; // a clipped highlight
