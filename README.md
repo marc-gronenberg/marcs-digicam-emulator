@@ -1,4 +1,4 @@
-# Marcs Digicam Emulator (v0.1.0)
+# Marcs Digicam Emulator (v0.1.1)
 
 The look of 2000s CCD compact cameras for **PhotoCraft**, as one WebAssembly filter plug-in
 (plug-in ABI v1): eight cameras from 2002 to 2009, each a modelled CCD sensor (primary RGB or
@@ -97,22 +97,24 @@ pixel's full well (about 2000 e⁻ per µm²), read noise that shrinks with gain
 scene through the camera's white balance and matrix, so it clips, colours and tones the way the
 camera's did. After the LUT come the spatial stages, on the encoded image as in the cameras:
 blooming (an exponential spill up and down the column, longer the more the highlight is blown),
-purple fringing (a violet halo on the dark side of blown edges), noise reduction (chroma blurred,
-luma softened at high ISO) and sharpening (unsharp mask on luma with a small threshold).
+purple fringing (a violet halo on the dark side of blown edges), noise reduction (chroma kept at
+half resolution, as the cameras' 4:2:0 JPEGs stored it, and blurred there; luma softened at high
+ISO) and sharpening (unsharp mask on luma with a small threshold).
 
 ## Limits
 
 - The sensors are models, not measurements; the makers' processing is unpublished and modelled.
 - **No full-height smear.** A real CCD smears a bright light into a vertical line over the whole
   frame; a PhotoCraft plug-in sees the image in bands of 256 rows, so only the local blooming
-  (up to about 30 px) is possible.
+  (up to about 20 px) is possible.
 - Noise is per document pixel: it is the camera's noise when the document is at the camera's
   resolution, finer when larger, coarser when smaller.
 - Noise added in the shadows is clipped at black like in the cameras, which lifts deep shadows a
   little at ISO 800 and 1600.
 - No JPEG artefacts, resolution loss or date stamp (yet).
-- Speed: every pixel takes the full path (noise makes each one different), about 60 s for 24 MP
-  on two threads in the test host; PhotoCraft runs four bands at once.
+- Speed: every pixel takes the full path (noise makes each one different, so a colour cache like
+  the film emulator's misses too often: tried, 30–50 % slower), about 40 s for 24 MP on two
+  threads in the test host (v0.1.0: 60 s); PhotoCraft runs four bands at once.
 - RGB and Grayscale only.
 
 ## Layout

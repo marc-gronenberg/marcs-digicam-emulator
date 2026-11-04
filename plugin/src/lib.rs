@@ -1,6 +1,6 @@
 //! Marcs Digicam Emulator: the look of 2000s CCD compact cameras for PhotoCraft (plug-in ABI v1).
 //!
-//! Per band (with a 48 px overlap, for the spatial stages):
+//! Per band (with a 32 px overlap, for the spatial stages):
 //!
 //! 1. the document to linear sRGB (Input Space), the camera's exposure compensation;
 //! 2. sensor noise in the raw channels (shot noise from the pixel's full well, read noise, both
@@ -29,7 +29,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 const MANIFEST: &str = r#"{
   "id": "io.marcs.digicam",
   "name": "Marcs Digicam Emulator…",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "filter",
   "author": "Marc Gronenberg",
   "description": "The look of 2000s CCD compact cameras: sensor colour, hard digital highlights, sensor noise by ISO, noise reduction, oversharpening, blooming and purple fringing. RGB and Grayscale.",
@@ -46,11 +46,11 @@ const MANIFEST: &str = r#"{
     "purpleFringing": {"type": "number", "min": 0, "max": 200, "default": 100},
     "seed":       {"type": "int", "min": 0, "max": 9999, "default": 1}
   },
-  "overlap": 48,
+  "overlap": 32,
   "area": "content"
 }"#;
 
-const OVERLAP: usize = 48;
+const OVERLAP: usize = 32;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_abi_version() -> u32 {
@@ -321,6 +321,44 @@ unsafe fn camera<const K: usize, const NOISE: bool>(buf: *mut f32, w: usize, h: 
     any
 }
 
+/// Chroma at half resolution, the way the cameras' JPEGs stored it (4:2:0) and blurred it: the
+/// `w × h` plane `c` is averaged over 2x2 blocks into `half`, blurred with radius `r` there and
+/// interpolated back. `tmp` is scratch of the half plane's size.
+///
+/// # Safety
+/// `c` holds `w × h` floats, `half` and `tmp` at least `ceil(w/2) × ceil(h/2)`.
+unsafe fn chroma_half(c: *mut f32, half: *mut f32, tmp: *mut f32, w: usize, h: usize, r: usize) {
+    let (hw, hh) = (w.div_ceil(2), h.div_ceil(2));
+    unsafe {
+        for y in 0..hh {
+            let (y0, y1) = (2 * y, if 2 * y + 1 < h { 2 * y + 1 } else { 2 * y });
+            for x in 0..hw {
+                let (x0, x1) = (2 * x, if 2 * x + 1 < w { 2 * x + 1 } else { 2 * x });
+                *half.add(y * hw + x) = (*c.add(y0 * w + x0) + *c.add(y0 * w + x1) + *c.add(y1 * w + x0) + *c.add(y1 * w + x1)) * 0.25;
+            }
+        }
+        blur(half, tmp, hw, hh, r);
+        // back up by bilinear interpolation between half-plane centres
+        for y in 0..h {
+            let fy = (y as f32 - 0.5) * 0.5;
+            let fy = if fy < 0.0 { 0.0 } else { fy };
+            let iy = fy as usize;
+            let (iy, jy, ty) = if iy + 1 < hh { (iy, iy + 1, fy - iy as f32) } else { (hh - 1, hh - 1, 0.0) };
+            for x in 0..w {
+                let fx = (x as f32 - 0.5) * 0.5;
+                let fx = if fx < 0.0 { 0.0 } else { fx };
+                let ix = fx as usize;
+                let (ix, jx, tx) = if ix + 1 < hw { (ix, ix + 1, fx - ix as f32) } else { (hw - 1, hw - 1, 0.0) };
+                let (a, b) = (*half.add(iy * hw + ix), *half.add(iy * hw + jx));
+                let (cc, d) = (*half.add(jy * hw + ix), *half.add(jy * hw + jx));
+                let top = a + (b - a) * tx;
+                let bot = cc + (d - cc) * tx;
+                *c.add(y * w + x) = top + (bot - top) * ty;
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------- the filter
 
 /// # Safety
@@ -414,6 +452,8 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     };
     let planes = (pr, pg, pb, blown);
     // SAFETY: buf holds w × h × n samples, the planes w × h floats each
+    // every pixel takes the full path: sensor noise makes each one different, so a colour cache
+    // (as in Marcs Film Emulator) misses too often to pay (tried: 30-50 % slower on photos)
     let any_blown = unsafe {
         match (cam.channels, noise_amt > 0.0) {
             (4, true) => camera::<4, true>(buf, w, h, &doc, &sensor, planes),
@@ -428,9 +468,9 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         // charge spilling along the column, both ways, falling off over `reach` pixels; reach
         // and amount are kept inside the overlap so bands meet without seams
         if bloom_amt > 0.0 && any_blown {
-            // reach <= 10 px: falls below 1 % within the 48 px overlap
-            let reach = 4.0 + 4.0 * bloom_amt;
-            let reach = if reach > 10.0 { 10.0 } else { reach };
+            // reach <= 7 px: falls below 1 % within the 32 px overlap
+            let reach = 3.0 + 3.0 * bloom_amt;
+            let reach = if reach > 7.0 { 7.0 } else { reach };
             let keep = 1.0 - 1.0 / reach;
             for x in 0..w {
                 let mut acc = 0.0f32;
@@ -480,11 +520,11 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
             *pg.add(i) = b - y;
             *pb.add(i) = r - y;
         }
-        // chroma blurred (the cameras' main weapon against colour noise)
-        let rc = (nr_amt * 2.5 + 0.5) as usize;
-        let rc = if rc > 12 { 12 } else { rc };
-        blur(pg, s2, w, h, rc);
-        blur(pb, s2, w, h, rc);
+        // chroma at half resolution and blurred (the cameras' main weapon against colour noise)
+        let rc = (nr_amt * 1.25 + 0.5) as usize;
+        let rc = if rc > 6 { 6 } else { rc };
+        chroma_half(pg, s1, s2, w, h, rc);
+        chroma_half(pb, s1, s2, w, h, rc);
         // luma, against one blur of itself: softened towards it at higher noise reduction (the
         // "watercolour"), then sharpened away from it (unsharp mask, with its halos)
         let wl = (nr_amt - 0.6) * 0.35;
@@ -508,6 +548,7 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         }
 
         // ---------------------------------------------------------------- 7: back, Strength, write
+        let direct = !linear_doc && ident && !grey && strength >= 1.0;
         for y in ov..h - ov {
             for x in ov..w - ov {
                 let i = y * w + x;
@@ -519,6 +560,13 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
                 let er = yy + cr;
                 let eb = yy + cb;
                 let eg = (yy - 0.299 * er - 0.114 * eb) / 0.587;
+                if direct {
+                    // the camera's output is sRGB-encoded, like the document
+                    *p = clamp01(er);
+                    *p.add(1) = clamp01(eg);
+                    *p.add(2) = clamp01(eb);
+                    continue;
+                }
                 // camera output (sRGB-encoded) -> linear sRGB
                 let (cr_, cg_, cb_) = (lerp_tab(odec, er), lerp_tab(odec, eg), lerp_tab(odec, eb));
                 let lin = |v: f32| if linear_doc { if v > 0.0 { v } else { 0.0 } } else { lerp_tab(dec, v) };
