@@ -237,7 +237,7 @@ mod tests {
     const W: usize = 256;
     const H: usize = 4;
     const RGBA: u32 = (1 << 8) | (3 << 16);
-    // The ramp tests run the film without overlap (`_image.overlap` 0), so every pixel counts.
+    // The ramp tests run the plug-in without overlap (`_image.overlap` 0), so every pixel counts.
 
     fn host(name: &str) -> Host {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../dist/");
@@ -259,9 +259,17 @@ mod tests {
     /// Runs a band of `w × h` RGBA pixels whose outer `ov` pixels are overlap, with the host's
     /// `_image` geometry added to `params` (a JSON object).
     fn run_band(host: &Host, data: &mut [f32], w: usize, h: usize, ov: usize, depth: u32, params: &str) {
-        let p = format!(r#"{{"_image":{{"x":0,"y":0,"width":{w},"height":{h},"overlap":{ov}}}{}{}"#, if params.len() > 2 { "," } else { "" }, &params[1..]);
-        host.filter(data, w as u32, h as u32, 4, depth | RGBA, p.as_bytes()).expect("filter");
+        run_layout(host, data, w, h, ov, 4, depth | RGBA, params);
     }
+
+    /// As `run_band`, for any channel count and format (`GA` for grey documents).
+    #[allow(clippy::too_many_arguments)]
+    fn run_layout(host: &Host, data: &mut [f32], w: usize, h: usize, ov: usize, ch: u32, fmt: u32, params: &str) {
+        let p = format!(r#"{{"_image":{{"x":0,"y":0,"width":{w},"height":{h},"overlap":{ov}}}{}{}"#, if params.len() > 2 { "," } else { "" }, &params[1..]);
+        host.filter(data, w as u32, h as u32, ch, fmt, p.as_bytes()).expect("filter");
+    }
+
+    const GA: u32 = (1 << 8) | (1 << 16);
 
     /// The ramp band, no overlap.
     fn run(host: &Host, data: &mut [f32], depth: u32, params: &str) {
@@ -269,7 +277,7 @@ mod tests {
     }
 
     /// A band of `w × h` with `ov` overlap: dark grey with a white disc in the middle (a highlight
-    /// for the halation to glow around), 8-bit levels.
+    /// that is clipped in the document, to bloom and fringe), 8-bit levels.
     fn disc(w: usize, h: usize) -> Vec<f32> {
         let mut v = Vec::with_capacity(w * h * 4);
         for y in 0..h {
@@ -306,16 +314,48 @@ mod tests {
         (l.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / l.len() as f32).sqrt()
     }
 
+    /// Strength 0 leaves every kind of document exactly as it was: every input space and depth,
+    /// colour and grey (32-bit with a negative value, which a round trip would clip).
     #[test]
     fn strength_0_returns_the_original() {
         let cam = host("marcs-digicam-emulator.wasm");
-        for depth in [8, 16] {
-            let orig = ramp(1.0);
+        for depth in [8, 16, 32] {
+            for space in ["sRGB", "Display P3", "Adobe RGB"] {
+                let mut orig = ramp(1.0);
+                orig[0] = if depth == 32 { -0.1 } else { 0.0 };
+                let mut out = orig.clone();
+                run(&cam, &mut out, depth, &format!(r#"{{"strength":0,"iso":"1600","inputSpace":"{space}"}}"#));
+                assert!(orig == out, "{space} {depth}-bit: original changed");
+            }
+            let orig: Vec<f32> = (0..W * H).flat_map(|i| [(i % W) as f32 / (W - 1) as f32, 1.0]).collect();
             let mut out = orig.clone();
-            run(&cam, &mut out, depth, r#"{"strength":0,"iso":"1600"}"#);
-            let worst = orig.iter().zip(&out).map(|(a, b)| (a - b).abs() * 255.0).fold(0.0f32, f32::max);
-            assert!(worst <= 1.0, "{depth}-bit: original changed by {worst} levels");
+            run_layout(&cam, &mut out, W, H, 0, 2, depth | GA, r#"{"strength":0}"#);
+            assert!(orig == out, "grey {depth}-bit: original changed");
         }
+    }
+
+    /// The input spaces' matrices: a saturated primary keeps its hue in every space; and a grey
+    /// document comes out as a rising grey scale.
+    #[test]
+    fn input_spaces_keep_primaries_and_grey_documents_work() {
+        let cam = host("marcs-digicam-emulator.wasm");
+        let (w, h) = (16, 16);
+        for space in ["sRGB", "Display P3", "Adobe RGB"] {
+            for c in 0..3 {
+                let mut px = [0.15f32, 0.15, 0.15, 1.0];
+                px[c] = 0.8;
+                let mut out: Vec<f32> = (0..w * h).flat_map(|_| px).collect();
+                run_band(&cam, &mut out, w, h, 0, 8, &format!(r#"{{"inputSpace":"{space}","noise":0,"sharpening":0,"noiseReduction":0}}"#));
+                let p = &out[(8 * w + 8) * 4..(8 * w + 8) * 4 + 3];
+                assert!((0..3).all(|k| k == c || p[c] > p[k] + 0.1), "{space}: primary {c} came out {p:?}");
+            }
+        }
+        let mut g: Vec<f32> = (0..W * H).flat_map(|i| [(i % W) as f32 / (W - 1) as f32, 1.0]).collect();
+        run_layout(&cam, &mut g, W, H, 0, 2, 8 | GA, r#"{"noise":0,"sharpening":0,"noiseReduction":0,"blooming":0,"purpleFringing":0}"#);
+        for x in 1..W {
+            assert!(g[2 * x] + 0.5 / 255.0 >= g[2 * (x - 1)], "grey document: falls at level {x}");
+        }
+        assert!(g[0] < 0.1 && g[2 * (W - 1)] > 0.9, "grey document: black {}, white {}", g[0], g[2 * (W - 1)]);
     }
 
     #[test]
@@ -339,7 +379,7 @@ mod tests {
         let cam = host("marcs-digicam-emulator.wasm");
         for name in CAMERAS {
             let mut out = ramp(1.0);
-            run(&cam, &mut out, 8, &format!(r#"{{"camera":"{name}","noise":0,"sharpening":0,"noiseReduction":0}}"#));
+            run(&cam, &mut out, 8, &format!(r#"{{"camera":"{name}","noise":0,"sharpening":0,"noiseReduction":0,"blooming":0,"purpleFringing":0}}"#));
             let row: Vec<f32> = out[..W * 4].chunks(4).map(luma).collect();
             for x in 1..W {
                 assert!(row[x] + 0.5 / 255.0 >= row[x - 1], "{name}: luminance falls at level {x}: {} -> {}", row[x - 1], row[x]);
@@ -368,18 +408,37 @@ mod tests {
         assert!(std_luma(&quiet) * 255.0 < 0.01, "noise 0 still has noise");
     }
 
-    /// A blown highlight turns white and blooms along the column, not along the row.
+    /// A highlight clipped in the document (at Exposure 0) turns white and blooms along the
+    /// column, not along the row.
     #[test]
     fn blown_highlight_blooms_vertically() {
         let cam = host("marcs-digicam-emulator.wasm");
         let (w, h, ov) = (448, 256, 48);
         let mut out = disc(w, h);
-        run_band(&cam, &mut out, w, h, ov, 8, r#"{"camera":"Pocket 2002","exposure":2,"blooming":200,"purpleFringing":0,"noise":0,"sharpening":0,"noiseReduction":0}"#);
+        run_band(&cam, &mut out, w, h, ov, 8, r#"{"camera":"Pocket 2002","blooming":200,"purpleFringing":0,"noise":0,"sharpening":0,"noiseReduction":0}"#);
         let px = |x: usize, y: usize| luma(&out[(y * w + x) * 4..]);
         let (cx, cy) = (w / 2, h / 2);
         assert!(px(cx, cy) > 0.97, "the blown disc is {}", px(cx, cy));
         // the disc's radius is 20 px: 8 px beyond its edge, above vs. beside it
         let (above, beside) = (px(cx, cy - 28), px(cx + 28, cy));
         assert!(above > beside + 0.05, "no vertical bloom: above {above}, beside {beside}");
+    }
+
+    /// A highlight clipped in the document fringes purple on its dark side, at default settings.
+    #[test]
+    fn blown_highlight_fringes_purple() {
+        let cam = host("marcs-digicam-emulator.wasm");
+        let (w, h, ov) = (448, 256, 48);
+        let base = r#""camera":"Ultracompact 2008","noise":0,"sharpening":0,"noiseReduction":0,"blooming":0"#;
+        let mut on = disc(w, h);
+        run_band(&cam, &mut on, w, h, ov, 8, &format!("{{{base}}}"));
+        let mut off = disc(w, h);
+        run_band(&cam, &mut off, w, h, ov, 8, &format!(r#"{{{base},"purpleFringing":0}}"#));
+        // 2 px beyond the disc's edge (radius 20): blue over green
+        let violet = |d: &[f32]| {
+            let i = ((h / 2) * w + w / 2 + 22) * 4;
+            d[i + 2] - d[i + 1]
+        };
+        assert!(violet(&on) > violet(&off) + 0.03, "no purple fringe: {} vs {} without", violet(&on), violet(&off));
     }
 }

@@ -29,7 +29,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 const MANIFEST: &str = r#"{
   "id": "io.marcs.digicam",
   "name": "Marcs Digicam Emulator…",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "kind": "filter",
   "author": "Marc Gronenberg",
   "description": "The look of 2000s CCD compact cameras: sensor colour, hard digital highlights, sensor noise by ISO, noise reduction, oversharpening, blooming and purple fringing. RGB and Grayscale.",
@@ -98,7 +98,6 @@ pub struct Camera {
     raw_to_scene: [[f32; 4]; 3],
     /// electrons at base ISO
     full_well: f32,
-    read_noise: f32,
     sharpen: f32,
     sharpen_radius: f32,
     nr: f32,
@@ -108,12 +107,15 @@ pub struct Camera {
 
 include!("cameras.rs");
 
-/// `u8base[256] | odec[TN+1] | enc[TN+1] | log2m[257] | u16base[65536]` as `f32` (make_tables.py).
-const TABLES_LEN: usize = 256 + 2 * (TN + 1) + 257 + 65536;
+/// Read noise in electrons at base ISO, the same for every camera (the model has no per-camera value).
+const READ_NOISE: f32 = 10.0;
+
+/// `odec[TN+1] | enc[TN+1] | log2m[257]` as `f32` (make_tables.py).
+const TABLES_LEN: usize = 2 * (TN + 1) + 257;
 static TABLE_BYTES: &Aligned<[u8; TABLES_LEN * 4]> = &Aligned(*include_bytes!("../../lut/tables.bin"));
-const ODEC: usize = 256;
-const ENC: usize = 256 + (TN + 1);
-const LOG2M: usize = 256 + 2 * (TN + 1);
+const ODEC: usize = 0;
+const ENC: usize = TN + 1;
+const LOG2M: usize = 2 * (TN + 1);
 /// `adec[TN+1] | aenc[TN+1]`: Adobe RGB (1998) transfer curve (gamma 563/256) and its inverse.
 static ADOBE_BYTES: &Aligned<[u8; 2 * (TN + 1) * 4]> = &Aligned(*include_bytes!("../../lut/adobe.bin"));
 /// Linear Display P3 / Adobe RGB (D65) -> linear sRGB and back (rows sum to 1: white stays white).
@@ -292,6 +294,12 @@ unsafe fn camera<const K: usize, const NOISE: bool>(buf: *mut f32, w: usize, h: 
                 if K == 4 && r3 > top {
                     top = r3;
                 }
+                // an 8/16-bit channel at its top was already clipped in the source (its white sits
+                // below full well in every camera): one stop over at Exposure 0, so it blooms and fringes
+                if !doc.linear && (*p >= 0.999 || (!doc.grey && (*p.add(1) >= 0.999 || *p.add(2) >= 0.999))) {
+                    let t = 2.0 * doc.ev;
+                    top = if t > top { t } else { top };
+                }
                 *blown.add(i) = if top > 1.0 {
                     any = true;
                     log2_fast(top)
@@ -390,6 +398,9 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     };
     let ev = exp2(g("exposure", 0.0).clamp(-2.0, 2.0));
     let strength = clamp01(g("strength", 100.0) / 100.0);
+    if strength <= 0.0 {
+        return 0; // the original, untouched
+    }
     let noise_amt = g("noise", 100.0).clamp(0.0, 200.0) / 100.0;
     let nr_amt = g("noiseReduction", 100.0).clamp(0.0, 200.0) / 100.0 * cam.nr * sqrt(iso_gain);
     let sharpen_amt = g("sharpening", 100.0).clamp(0.0, 200.0) / 100.0 * cam.sharpen;
@@ -438,8 +449,8 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
         inv_fw: iso_gain / cam.full_well,
         read_var: {
             // read noise in electrons: a part before the amplifier (stays) and one after it
-            // (shrinks with the gain); `read_noise` is roughly their total at base ISO
-            let (pre, post) = (cam.read_noise * 0.25, cam.read_noise / iso_gain);
+            // (shrinks with the gain); `READ_NOISE` is roughly their total at base ISO
+            let (pre, post) = (READ_NOISE * 0.25, READ_NOISE / iso_gain);
             let sigma = sqrt(pre * pre + post * post) * iso_gain / cam.full_well;
             sigma * sigma
         },

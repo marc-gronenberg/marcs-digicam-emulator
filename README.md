@@ -1,4 +1,4 @@
-# Marcs Digicam Emulator (v0.1.1)
+# Marcs Digicam Emulator (v0.1.2)
 
 The look of 2000s CCD compact cameras for **PhotoCraft**, as one WebAssembly filter plug-in
 (plug-in ABI v1): eight cameras from 2002 to 2009, each a modelled CCD sensor (primary RGB or
@@ -95,7 +95,10 @@ scene exposure:
 In the plug-in, before the LUT, **sensor noise** is added in the raw channels – shot noise from the
 pixel's full well (about 2000 e⁻ per µm²), read noise that shrinks with gain – and carried into the
 scene through the camera's white balance and matrix, so it clips, colours and tones the way the
-camera's did. After the LUT come the spatial stages, on the encoded image as in the cameras:
+camera's did. A channel at the top of an 8- or 16-bit document was already clipped in the source,
+so it counts as one stop over full well (at Exposure 0) and blooms and fringes like a blown
+highlight; 32-bit documents carry the real brightness. After the LUT come the spatial stages, on
+the encoded image as in the cameras:
 blooming (an exponential spill up and down the column, longer the more the highlight is blown),
 purple fringing (a violet halo on the dark side of blown edges), noise reduction (chroma kept at
 half resolution, as the cameras' 4:2:0 JPEGs stored it, and blurred there; luma softened at high
@@ -113,8 +116,9 @@ ISO) and sharpening (unsharp mask on luma with a small threshold).
   little at ISO 800 and 1600.
 - No JPEG artefacts, resolution loss or date stamp (yet).
 - Speed: every pixel takes the full path (noise makes each one different, so a colour cache like
-  the film emulator's misses too often: tried, 30–50 % slower), about 40 s for 24 MP on two
-  threads in the test host (v0.1.0: 60 s); PhotoCraft runs four bands at once.
+  the film emulator's misses too often: tried, 30–50 % slower), about 44 s for 24 MP on two
+  threads in the test host, up to about 54 s when many highlights are blown (blooming and fringing
+  then run; Blooming and Purple Fringing at 0 skip them); PhotoCraft runs four bands at once.
 - RGB and Grayscale only.
 
 ## Layout
@@ -125,7 +129,7 @@ ISO) and sharpening (unsharp mask on luma with a small threshold).
 | `common/` | ABI glue, parameter reader, table lookups, blurs |
 | `model/digicam_model.py` | the camera model → `lut/<camera>.lut` and `plugin/src/cameras.rs` |
 | `model/make_tables.py` | decode tables, Adobe RGB tables, the sensor noise texture |
-| `harness/` | test host mirroring PhotoCraft's plug-in host; `cargo test --release` there checks the plug-in in `dist/` (Strength 0 is the identity, every camera at every depth and ISO, monotonic grey without noise, noise growing with ISO, blooming vertical) |
+| `harness/` | test host mirroring PhotoCraft's plug-in host; `cargo test --release` there checks the plug-in in `dist/` (Strength 0 is the identity for every input space, depth and grey, every camera at every depth and ISO, primaries keep their hue in every input space, monotonic grey without noise, noise growing with ISO, a highlight clipped in the document blooms vertically and fringes purple) |
 | `build.sh` | build and test (`--data` re-runs the model first) |
 
 ## Licence
