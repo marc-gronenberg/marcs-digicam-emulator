@@ -312,6 +312,33 @@ impl Doc {
     }
 }
 
+/// The sums of a full `F × F` block of document pixels from `p0` (rows `pitch` samples apart,
+/// pixels `n`), and its count of clipped pixels, added in row order like the general loop in
+/// `pc_filter`, so the result is the same to the bit; unrolled for the interpreter.
+///
+/// # Safety
+/// `p0` reaches `(F - 1) × pitch + F × n` samples.
+#[inline(always)]
+unsafe fn block_sum<const F: usize>(p0: *const f32, pitch: usize, n: usize, grey: bool, doc: &Doc) -> (f32, f32, f32, f32) {
+    let (mut sr, mut sg, mut sb, mut sc) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for dy in 0..F {
+        for dx in 0..F {
+            unsafe {
+                let p = p0.add(dy * pitch + dx * n);
+                sr += *p;
+                if !grey {
+                    sg += *p.add(1);
+                    sb += *p.add(2);
+                }
+                if doc.clipped(p) {
+                    sc += 1.0;
+                }
+            }
+        }
+    }
+    (sr, sg, sb, sc)
+}
+
 /// The sensor and its noise, for one band.
 struct Sensor {
     /// the camera's LUT as floats
@@ -603,7 +630,6 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     };
     let cols = take(pw * 12) as *mut u32; // 3 × pw words for the chroma upsampling
     let upc = take(w * 12) as *mut u32; // 3 × w words for the upscaling (f > 1)
-    let lxs = take(w * 4) as *mut u32; // each document column's camera column (f > 1)
     let rows = take(w * 24) as *mut f32; // two camera rows at document width, 3 values each (f > 1)
     let dec8 = take(256 * 4) as *mut f32;
     let sh = take((SH_LEN + 1) * 4) as *mut f32;
@@ -636,47 +662,66 @@ pub unsafe extern "C" fn pc_filter(buf: *mut f32, len: u32, width: u32, height: 
     // ---------------------------------------------------------------- 0: camera pixels (f > 1)
     if f > 1 {
         let [ir, ig, ib, ic] = pl.inp;
-        // SAFETY: buf holds w × h × n samples, the input planes pw × ph floats (zeroed)
+        // each camera column's first and last document column in the band (`upc` is free until
+        // the upscaling)
+        let (xa, xb) = (upc, unsafe { upc.add(pw) });
+        // the band's document pixels (first, last; band-relative) of block `b` along one axis
+        let span = |b: i32, o: i32, len: usize| -> (usize, usize) {
+            let lo = if b * fi > o { b * fi } else { o };
+            let hi = if b * fi + fi - 1 < o + len as i32 - 1 { b * fi + fi - 1 } else { o + len as i32 - 1 };
+            ((lo - o) as usize, (hi - o) as usize)
+        };
+        // SAFETY: buf holds w × h × n samples, the input planes pw × ph floats, upc 3 × w words
+        // (pw <= w)
         unsafe {
-            for x in 0..w {
-                *lxs.add(x) = ((x0 + x as i32).div_euclid(fi) - bx0) as u32;
+            for lx in 0..pw {
+                let (a, b) = span(bx0 + lx as i32, x0, w);
+                *xa.add(lx) = a as u32;
+                *xb.add(lx) = b as u32;
             }
-            // sums of the document's values per camera pixel (encoded: decoded once per block, a
-            // little darker on fine bright detail than light would average, and faster), and of
-            // its clipped pixels
-            for y in 0..h {
-                let row = ((y0 + y as i32).div_euclid(fi) - by0) as usize * pw;
-                for x in 0..w {
-                    let p = buf.add((y * w + x) * n);
-                    let l = row + *lxs.add(x) as usize;
-                    *ir.add(l) += *p;
-                    if !grey {
-                        *ig.add(l) += *p.add(1);
-                        *ib.add(l) += *p.add(2);
-                    }
-                    if doc.clipped(p) {
-                        *ic.add(l) += 1.0;
-                    }
-                }
-            }
-            // the means (over the document pixels the band has of each block), in sRGB primaries
-            let span = |b: i32, o: i32, len: usize| {
-                let lo = if b * fi > o { b * fi } else { o };
-                let hi = if b * fi + fi - 1 < o + len as i32 - 1 { b * fi + fi - 1 } else { o + len as i32 - 1 };
-                (hi - lo + 1) as f32
-            };
+            // per camera pixel the sums of the document's values (encoded: decoded once per block,
+            // a little darker on fine bright detail than light would average, and faster) and of
+            // its clipped pixels, gathered row by row as the camera pixel's own locals; then the
+            // mean, in sRGB primaries
             for ly in 0..ph {
-                let cy = span(by0 + ly as i32, y0, h);
+                let (ya, yb) = span(by0 + ly as i32, y0, h);
+                let cy = (yb - ya + 1) as f32;
                 for lx in 0..pw {
-                    let inv = 1.0 / (cy * span(bx0 + lx as i32, x0, w));
+                    let (xa_, xb_) = (*xa.add(lx) as usize, *xb.add(lx) as usize);
+                    let p0 = buf.add((ya * w + xa_) * n);
+                    let full = xb_ - xa_ + 1 == f && yb - ya + 1 == f;
+                    let (sr, sg, sb, sc) = match (full, f) {
+                        (true, 2) => block_sum::<2>(p0, w * n, n, grey, &doc),
+                        (true, 3) => block_sum::<3>(p0, w * n, n, grey, &doc),
+                        (true, _) => block_sum::<4>(p0, w * n, n, grey, &doc),
+                        _ => {
+                            let (mut sr, mut sg, mut sb, mut sc) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                            for y in ya..=yb {
+                                let mut p = buf.add((y * w + xa_) * n);
+                                for _ in xa_..=xb_ {
+                                    sr += *p;
+                                    if !grey {
+                                        sg += *p.add(1);
+                                        sb += *p.add(2);
+                                    }
+                                    if doc.clipped(p) {
+                                        sc += 1.0;
+                                    }
+                                    p = p.add(n);
+                                }
+                            }
+                            (sr, sg, sb, sc)
+                        }
+                    };
+                    let inv = 1.0 / (cy * (xb_ - xa_ + 1) as f32);
                     let l = ly * pw + lx;
-                    let r = doc.lin(*ir.add(l) * inv);
-                    let (gg, bb) = if grey { (r, r) } else { (doc.lin(*ig.add(l) * inv), doc.lin(*ib.add(l) * inv)) };
+                    let r = doc.lin(sr * inv);
+                    let (gg, bb) = if grey { (r, r) } else { (doc.lin(sg * inv), doc.lin(sb * inv)) };
                     let (r, gg, bb) = if ident { (r, gg, bb) } else { mat(&m_in, r, gg, bb) };
                     *ir.add(l) = r;
                     *ig.add(l) = gg;
                     *ib.add(l) = bb;
-                    *ic.add(l) *= inv;
+                    *ic.add(l) = sc * inv;
                 }
             }
         }
